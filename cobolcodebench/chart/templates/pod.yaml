@@ -1,0 +1,28 @@
+{{- $service := .Values.services.default }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    inspect/service: default
+  annotations:
+    {{- toYaml (.Values.annotations | default dict) | nindent 4 }}
+spec:
+  runtimeClassName: {{ $service.runtimeClassName }}
+  nodeSelector:
+    {{- toYaml $service.nodeSelector | nindent 4 }}
+  automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+  restartPolicy: Never
+  enableServiceLinks: false
+  containers:
+    - name: default
+      image: {{ $service.image }}
+      command: {{ $service.command | toJson }}
+      workingDir: {{ $service.workingDir }}
+      securityContext:
+        {{- toYaml $service.securityContext | nindent 8 }}
+      resources:
+        {{- toYaml $service.resources | nindent 8 }}

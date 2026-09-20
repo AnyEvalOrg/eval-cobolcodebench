@@ -1,0 +1,58 @@
+# AnyEval chart default values; provider chart is an explicit exception.
+# AnyEval: set INSPECT_K8S_DEFAULT_NAMESPACE=anyeval-sandbox.
+global:
+  nameOverride: ""
+  fullnameOverride: ""
+automountServiceAccountToken: false
+serviceAccountCreate: false
+allowDomains: []
+allowEntities: []
+allowCIDR: []
+services:
+  default:
+    # Cloud Build tag matches pyproject.toml; AnyEval pins the digest in its catalog.
+    image: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0
+    command: ["sleep", "infinity"]
+    workingDir: /tmp
+    runtimeClassName: gvisor
+    nodeSelector:
+      cloud.google.com/gke-spot: "true"
+    networkIsolated: true
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+        # Disk-backed /tmp/ccb-* requests, candidate files and captured streams.
+        ephemeral-storage: 1Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 1Gi
+# Standard NetworkPolicy is visible to AnyEval's provenance hook (which queries
+# networking.k8s.io). The Autopilot cluster has no CiliumNetworkPolicy CRD;
+# the custom AnyEval chart emits only this standard policy, including DNS denial.
+additionalResources:
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: '{{ .Release.Name }}-cobolcodebench-deny-all'
+      namespace: '{{ .Release.Namespace }}'
+    spec:
+      # Select THIS release's pod only. `podSelector: {}` selects every pod in the namespace,
+      # including shared infrastructure such as the egress proxy, and starved it of egress.
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/instance: '{{ .Release.Name }}'
+      policyTypes: [Ingress, Egress]
+      ingress: []
+      egress: []

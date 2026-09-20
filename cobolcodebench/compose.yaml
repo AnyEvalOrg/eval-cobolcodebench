@@ -1,0 +1,17 @@
+services:
+  default:
+    image: eval-cobol-sandbox:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sleep", "infinity"]
+    working_dir: /tmp
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 1.0
+    pids_limit: 128

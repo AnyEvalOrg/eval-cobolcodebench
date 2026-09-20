@@ -1,0 +1,5 @@
+version: 1
+redact: [inputs, outputs, canonical_solution, tests, test, result, value]
+global: [target, targets, answer, explanation]
+sandbox_exec: [input, stdout, stderr]
+# private_grading suppresses sandbox events and provider logs independently.

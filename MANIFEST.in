@@ -1,0 +1,6 @@
+include LICENSE NOTICE.md UPSTREAM-REVISION UPSTREAM-DATASET-CARD.md
+include anyeval.json redaction.yaml CobolCodeBench_Dataset.jsonl
+include run.py bundle.template.json
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include scaffolds *.yaml

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://anyeval.com/schema/bundle/1",
+  "bundle_version": 1,
+  "generated_at": null,
+  "eval": {
+    "id": "cobolcodebench",
+    "task": null,
+    "sample_id": null
+  },
+  "upstream": {
+    "repo": "https://huggingface.co/datasets/harshini-kumar/CobolCodeBench",
+    "inspect_ai": "0.3.260"
+  },
+  "dataset": {
+    "source": "harshini-kumar/CobolCodeBench",
+    "revision": "9d02534b7d1aabcbac1a1ec21c5a5e80c50323a8"
+  },
+  "model": {
+    "name": null,
+    "provider": null,
+    "served": []
+  },
+  "scaffold": {
+    "id": "baseline",
+    "version": 1,
+    "token_limit": null
+  },
+  "sandbox": {
+    "class": null,
+    "provenance": null
+  },
+  "scorer": {
+    "name": "file_scorer",
+    "metric": "pass@1"
+  },
+  "receipts": [],
+  "routing": [],
+  "outputs": {
+    "status": null,
+    "score": null,
+    "explanation": null
+  }
+}

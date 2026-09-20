@@ -1,0 +1,62 @@
+{
+  "anyeval_version": 1,
+  "eval": {
+    "id": "cobolcodebench",
+    "slug": "cobolcodebench",
+    "title": "CobolCodeBench: COBOL Generation and Completion",
+    "group": "Coding",
+    "tags": [
+      "coding",
+      "cobol",
+      "generation",
+      "completion",
+      "sandbox",
+      "pass@1"
+    ],
+    "source": "upstream"
+  },
+  "upstream": {
+    "repo": "https://huggingface.co/datasets/harshini-kumar/CobolCodeBench",
+    "path": "CobolCodeBench_Dataset.jsonl",
+    "commit": "9d02534b7d1aabcbac1a1ec21c5a5e80c50323a8",
+    "inspect_ai": "0.3.260",
+    "eval_version": "1.0.0",
+    "dependency": "",
+    "framework": "https://github.com/CobolCodeBench/CobolCodeBench-Framework"
+  },
+  "execution": {
+    "class": "sandbox-k8s",
+    "cost_class": "medium",
+    "sandbox": "k8s",
+    "requires_internet": false,
+    "fast": false,
+    "supports_k8s": true,
+    "environment": "cobolcodebench/values.yaml"
+  },
+  "tasks": [
+    {
+      "name": "cobolcodebench_instruct",
+      "samples": 46
+    },
+    {
+      "name": "cobolcodebench_complete",
+      "samples": 46
+    }
+  ],
+  "total_samples": 92,
+  "external_assets": [
+    {
+      "type": "container",
+      "source": "us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0"
+    },
+    {
+      "type": "container",
+      "source": "coredns/coredns:1.8.3",
+      "condition": "Explicit anyeval_chart=false exception only; absent from default chart"
+    }
+  ],
+  "scaffolds": [
+    "baseline"
+  ],
+  "generated": "2026-09-20"
+}

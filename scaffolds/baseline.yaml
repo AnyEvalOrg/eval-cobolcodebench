@@ -1,0 +1,11 @@
+id: baseline
+version: 1
+description: Upstream chat prompts, one generation, exact-match pass@1.
+upstream_default: false
+budget:
+  max_turns: 1
+  max_tokens: 4096
+notes: >
+  No tools or test feedback. One epoch. Default temperature 0.3 and max_tokens
+  4096 mirror upstream GPT chat-api; caller overrides must be reported.
+  Upstream generated five samples per task; this adapter uses one (pass@1).

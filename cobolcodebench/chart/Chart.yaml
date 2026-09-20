@@ -1,0 +1,4 @@
+apiVersion: v2
+name: cobolcodebench-sandbox
+version: 1.0.0
+description: AnyEval CobolCodeBench sandbox with standard NetworkPolicy and no sidecars
