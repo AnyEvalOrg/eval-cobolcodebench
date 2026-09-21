@@ -145,8 +145,26 @@ sweeps, process/memory/file-size limits, and cleanup on cancellation or provider
 failure. Both `cobc` and generated executables have hard `RLIMIT_NPROC=64`
 (below the runtime's 128 PID limit), `RLIMIT_AS=RLIMIT_DATA=1 GiB`, and
 `RLIMIT_CORE=0`. Before dropping privileges, the supervisor sets the child's
-`oom_score_adj=1000`, inherited by descendants. The pod requests and limits
-are both 2 GiB, leaving headroom for the supervisor. This package has no Java
+`oom_score_adj=1000`, inherited by descendants; gVisor records this value but
+does not use it to choose OOM victims. A supervisor watchdog sums `VmRSS` from
+`/proc/<pid>/status` for every UID 65532 process every 50 ms during each step.
+Above 768 MiB it kills the candidate group and detached descendants and signs
+`memory_exceeded=true`, scored `INCORRECT` with reason `memory limit exceeded`.
+The pod requests and limits are both 2 GiB, leaving headroom for a 50 ms
+allocation burst, file page cache, shared memory and the supervisor. gVisor
+counts shared copy-on-write RSS per process, so a fork storm may trigger this
+watchdog before exhausting NPROC; either outcome is a signed `INCORRECT`.
+The root filesystem is read-only. `/tmp` is a disk-backed emptyDir with a
+512 MiB sizeLimit as an eviction backstop; the pod's ephemeral-storage budget
+is 1 GiB. `/dev/shm` remains a Memory emptyDir with sizeLimit 16 MiB.
+A second watchdog walks **all** of `/tmp` and `/dev/shm` every 100 ms,
+summing `st_blocks * 512` for regular files without following symlinks. Above
+256 MiB it uses the same candidate kill path and signs `disk_exceeded=true`,
+scored `INCORRECT` with reason `disk limit exceeded`. Allow one 100 ms write
+burst beyond the budget; gVisor gofer write throughput makes that burst small.
+Production gVisor does not enforce Memory emptyDir sizeLimit as a tmpfs size,
+so containment relies on the watchdog, not ENOSPC. GnuCOBOL/gcc use the
+writable, executable `/tmp`. This package has no Java
 execution steps; the shared image also contains Java tools. Candidate stdout cannot forge a passing provider completion marker.
 The output bound is **1 MiB** per captured stream/file and in aggregate across
 result files; reaching the bound fails. A missing or unverifiable authenticated
@@ -154,9 +172,15 @@ receipt is a harness failure: Inspect records a sanitized sample error, and
 AnyEval refuses to publish the run. It does not enter the published pass rate.
 The supervisor kills process groups and sweeps `/proc` using `os.kill`, without
 spawning cleanup processes. Post-run exceptions produce signed failure flags.
-A signed cleanup failure scores `INCORRECT`; the scorer still performs its
-independent UID cleanup. Failure of that independent infrastructure cleanup
-aborts scoring, preventing unsafe sandbox reuse.
+It builds, writes and flushes the receipt, then immediately calls `os._exit(0)`;
+it never deletes candidate directories. An independent exec checks UID
+quiescence and deletes `/tmp/ccb-*`, under its own five-second KILL deadline.
+The scorer decides authenticated failure before that cleanup: cleanup failure
+preserves the signed `INCORRECT` reason. After a successful receipt, cleanup
+failure instead scores `INCORRECT` with reason `candidate left processes that
+could not be cleaned up`. Cleanup failure without an authenticated receipt
+remains a sanitized harness error. The pod is per-sample and discarded
+afterwards, so it is never reused across samples.
 
 ## Scores and publication
 
@@ -261,9 +285,10 @@ compilation and these containment checks must be run on a suitable runtime;
 the package does not execute dataset or model programs on the developer host.
 
 The standalone real Linux regressions exercise the actual production
-`SETUP` + `RUNNER` and shared receipt verification/failure gate with three
+`SETUP` + `RUNNER` and shared receipt verification/failure gate with
 synthetic candidates: invalid stdout byte `0xff` with exit 1, detached children
-forked until failure, and unbounded memory allocation. Every case must produce
+forked until failure, unbounded memory allocation, three children each allocating
+600 MiB, and unbounded 1 MiB files that must trip the disk watchdog. Every failure case must produce
 an authenticated `INCORRECT` outcome; logs contain only stage, returncode and
 boolean flags. Run them in the reference image through Cloud Build:
 
@@ -272,15 +297,39 @@ gcloud builds submit . --config scripts/cloudbuild-linux-regressions.yaml
 ```
 
 The Docker builder runs the script as root in the reference image with its
-Docker CLI and socket available. The memory case runs in a separate
-`docker run --memory=512m --memory-swap=512m --pids-limit=128` container.
+Docker CLI copied into `/workspace` and passed via `--docker-cli`, with the
+socket available. The memory and disk cases run in a separate
+`docker run --memory=2g --memory-swap=2g --pids-limit=128 --read-only
+--volume /tmp --shm-size=16m` container.
 For an already running disposable reference container without Docker, use
 `python3 scripts/linux_regressions.py`: the memory case instead runs the actual
 supervisor under `prlimit` with a 1 GiB AS/DATA budget. That fallback verifies
-address-space exhaustion, not cgroup OOM survival. A present but unavailable
+per-process limits and the RSS watchdog; it does not run the aggregate-memory
+or disk cases without Docker's resource bounds. A present but unavailable
 Docker daemon fails the regression instead of silently using the fallback.
 These Linux checks require no Inspect installation in the image and are
 operator-run; the macOS unit suite does not claim to execute them.
+
+For production-runtime validation, use the operator's `KUBECONFIG` and run:
+
+```sh
+inspect eval scripts/k8s_regressions.py --model mockllm/model
+```
+
+This standalone Inspect task is not in the package registry. It uses the same
+Kubernetes chart and values as the package tasks (including gVisor and deny-all
+egress), with a mock model and synthetic Python candidates only. It checks
+`0xff` output, fork exhaustion, three 600 MiB children (requiring the signed
+`memory_exceeded` flag), unbounded disk writes (requiring signed
+`disk_exceeded=true` and a nonzero exit), and
+exit 0 with a detached sleeping child (requiring a successful receipt and
+cleanup). The disk writer creates a work-directory file and fills a second
+directory directly under `/tmp`, proving coverage beyond the work directory.
+Fork exhaustion accepts exit 1 with its witness or `memory_exceeded=true`.
+Every case must authenticate, meet its expected outcome, clean up,
+and leave the same pod usable before the scorer returns `CORRECT`. Printed
+JSON summaries contain boolean flags only. Run this on the production runtime;
+unit tests and native Docker checks alone do not establish gVisor behaviour.
 
 `anyeval.json` declares `sandbox-k8s` and 38 samples per task. Publishing into
 AnyEval additionally requires the application's distribution pin, catalog/task

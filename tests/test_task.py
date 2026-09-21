@@ -167,6 +167,14 @@ def test_render_default_chart_matches_anyeval_pod_contract(helm):
     assert security["seccompProfile"] == {"type": "RuntimeDefault"}
     assert security["runAsNonRoot"] is False
     assert security["allowPrivilegeEscalation"] is False
+    assert security["readOnlyRootFilesystem"] is True
+    assert spec['volumes'] == [
+        {'name': 'tmp', 'emptyDir': {'sizeLimit': '512Mi'}},
+        {'name': 'shm', 'emptyDir': {'medium': 'Memory', 'sizeLimit': '16Mi'}},
+    ]
+    assert container['volumeMounts'] == [
+        {'name': 'tmp', 'mountPath': '/tmp'}, {'name': 'shm', 'mountPath': '/dev/shm'},
+    ]
     assert security["capabilities"]["drop"] == ["ALL"]
     policy = next(r for r in resources if r and r["kind"] == "NetworkPolicy")
     assert policy["metadata"]["namespace"] == "anyeval-sandbox"

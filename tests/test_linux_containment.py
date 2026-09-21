@@ -82,6 +82,8 @@ print(pid, flush=True)
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt and receipt['returncode'] == 0 and receipt['stage'] == 'run'
         assert not process_running(int(receipt['output']))
+        assert Path(setup['cwd']).exists()
+        independent_cleanup()
         assert not Path(setup['cwd']).exists()
     finally:
         independent_cleanup()

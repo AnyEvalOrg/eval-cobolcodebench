@@ -22,7 +22,7 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
                 or not re.fullmatch(r'/tmp/ccb-[a-zA-Z0-9_-]+', receipt['cwd'])
                 or type(receipt['compile_success']) is not bool
                 or any(type(receipt.get(flag, False)) is not bool
-                       for flag in ('cleanup_failed', 'supervisor_error'))
+                       for flag in ('cleanup_failed', 'supervisor_error', 'memory_exceeded', 'disk_exceeded'))
                 or (receipt['stage'] == 'run' and not receipt['compile_success'])):
             return None
     except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
@@ -51,6 +51,10 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
 
 def receipt_failure(receipt: dict) -> str | None:
     """Shared INCORRECT gate; only successful receipts proceed to comparison."""
+    if receipt.get('memory_exceeded'):
+        return 'memory limit exceeded'
+    if receipt.get('disk_exceeded'):
+        return 'disk limit exceeded'
     if receipt.get('output_not_decodable'):
         return 'output not decodable'
     if receipt.get('cleanup_failed'):

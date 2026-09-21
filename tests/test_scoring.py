@@ -266,8 +266,9 @@ def test_cleanup_failure_aborts_before_next_test(monkeypatch, failure):
 
     fake = FailedCleanup([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
+    score = asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
+    assert score.value == INCORRECT
+    assert json.loads(score.explanation)['reason'] == 'candidate left processes that could not be cleaned up'
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
 
@@ -310,8 +311,9 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
             return await super().exec(cmd, **kwargs)
     fake = StillRunning([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert json.loads(score.explanation)['reason'] == 'candidate left processes that could not be cleaned up'
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
@@ -436,6 +438,8 @@ def test_authenticated_invalid_output_is_incorrect(monkeypatch, fields):
     {'returncode': True}, {'timeout': 1}, {'overflow': None}, {'stage': []},
     {'cwd': '../candidate'}, {'compile_success': 1}, {'cleanup_failed': 'yes'},
     {'supervisor_error': 1}, {'stage': 'run', 'compile_success': False},
+    {'memory_exceeded': 1}, {'disk_exceeded': 1}, {'disk_exceeded': None},
+    {'disk_exceeded': 'true'},
 ])
 def test_invalid_supervisor_fields_reject_envelope(fields):
     assert scoring.verify_receipt(resign_receipt(**fields), bytes(range(32))) is None
@@ -447,13 +451,52 @@ def test_bad_signature_rejected_before_output_decode():
     assert scoring.verify_receipt(json.dumps(envelope), bytes(range(32))) is None
 
 
-@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
+@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error', 'memory_exceeded', 'disk_exceeded'])
 def test_signed_supervision_failure_is_incorrect_with_independent_cleanup(monkeypatch, flag):
     fake = FakeSandbox([resign_receipt(**{flag: True})])
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
     assert score.value == INCORRECT
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('command', [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND],
+                         ids=['uid-kill', 'quiescence-or-deletion'])
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(), result('', returncode=2)])
+@pytest.mark.parametrize('receipt_kind', ['timeout', 'runtime', 'memory', 'success', 'missing'])
+def test_signed_verdict_precedes_failed_independent_cleanup(monkeypatch, command, failure, receipt_kind):
+    events = []
+    original_failure = scoring.receipt_failure
+    def decide(receipt):
+        events.append('verdict')
+        return original_failure(receipt)
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == command:
+                events.append('cleanup')
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return await super().exec(cmd, **kwargs)
+    fields = {'timeout': {'timeout': True}, 'runtime': {'returncode': 7},
+              'memory': {'memory_exceeded': True}, 'success': {}, 'missing': {}}[receipt_kind]
+    response = '' if receipt_kind == 'missing' else resign_receipt(**fields)
+    fake = FailedCleanup([response])
+    install_sandbox(monkeypatch, fake)
+    monkeypatch.setattr(scoring, 'receipt_failure', decide)
+    if receipt_kind == 'missing':
+        assert_sample_error()
+        assert events == ['cleanup']
+    else:
+        score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+        assert score.value == INCORRECT
+        assert json.loads(score.explanation)['reason'] == {
+            'timeout': 'run timeout', 'runtime': 'run error (exit 7)',
+            'memory': 'memory limit exceeded',
+            'success': 'candidate left processes that could not be cleaned up',
+        }[receipt_kind]
+        assert events == ['verdict', 'cleanup']
+    assert len(fake.paths) == 1
 
 
 @pytest.mark.parametrize('code', ["import os; os.write(1, b'\\xff'); raise SystemExit(1)",

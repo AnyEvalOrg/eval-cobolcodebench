@@ -11,9 +11,10 @@ steps:
           -v /var/run/docker.sock:/var/run/docker.sock \
           -e PATH=/workspace/.build:/usr/local/bin:/usr/bin:/bin \
           -w /workspace '${_SANDBOX_IMAGE}' \
-          /usr/local/bin/python3 scripts/linux_regressions.py --image '${_SANDBOX_IMAGE}'
+          /usr/local/bin/python3 scripts/linux_regressions.py --image '${_SANDBOX_IMAGE}' --docker-cli /workspace/.build/docker
 substitutions:
   _SANDBOX_IMAGE: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0
 # The outer container tests bytes/forks; the script launches a sibling with a
-# 512 MiB memory cgroup and 128 PIDs for the allocation attack, using this socket.
+# 2 GiB memory cgroup, writable /tmp volume and 128 PIDs for the aggregate memory
+# and disk watchdog attacks, using this socket.
 timeout: 600s

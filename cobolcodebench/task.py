@@ -23,7 +23,8 @@ def load_dataset(mode: str) -> MemoryDataset:
                          samples=[record_to_sample(r, mode) for r in load_eligible_records()])
 
 
-def _task(mode: str, sandbox_type: str, anyeval_chart: bool) -> Task:
+def task_sandbox(sandbox_type: str = 'k8s', anyeval_chart: bool = True):
+    """Shared by package tasks and the standalone production regression task."""
     if sandbox_type not in {'k8s', 'docker'}:
         raise ValueError('sandbox_type must be k8s or docker')
     resources = files('cobolcodebench')
@@ -32,8 +33,12 @@ def _task(mode: str, sandbox_type: str, anyeval_chart: bool) -> Task:
         from k8s_sandbox import K8sSandboxEnvironmentConfig
         os.environ.setdefault('INSPECT_K8S_DEFAULT_NAMESPACE', 'anyeval-sandbox')
         config = K8sSandboxEnvironmentConfig(chart=str(resources.joinpath('chart')), values=Path(config))
+    return sandbox_type, config
+
+
+def _task(mode: str, sandbox_type: str, anyeval_chart: bool) -> Task:
     return Task(dataset=load_dataset(mode), solver=generate(), scorer=file_scorer(mode),
-                sandbox=(sandbox_type, config), epochs=1, version='1.0.0',
+                sandbox=task_sandbox(sandbox_type, anyeval_chart), epochs=1, version='1.0.0',
                 config=GenerateConfig(temperature=0.3, max_tokens=4096),
                 metadata={'metric': 'pass@1', 'eligibility': eligibility(), 'dataset_provenance': {
                     k: v for k, v in manifest().items() if k != 'task_ids'}})

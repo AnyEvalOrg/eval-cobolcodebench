@@ -23,21 +23,30 @@ services:
       runAsGroup: 0
       runAsNonRoot: false
       allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
-    # Equal CPU/memory requests and limits give Guaranteed QoS. Each candidate
-    # cobc/executable has 1 GiB AS/DATA hard limits; 2 GiB leaves headroom for
-    # the root supervisor, compiler children, capture buffers and pod overhead.
-    # Candidate NPROC=64 stays below the runtime's 128 PID budget; candidates
-    # inherit oom_score_adj=1000 so an overshoot preferentially kills them.
+    # Equal CPU/memory requests and limits give Guaranteed QoS. Budget:
+    # 768 MiB aggregate candidate RSS + one 50 ms allocation burst, writable
+    # file page cache, /dev/shm and supervisor/overhead must fit below 2 GiB.
+    # Native AS/DATA remain 1 GiB per process; NPROC=64. gVisor ignores
+    # oom_score_adj when choosing OOM victims, so it is not a safety boundary.
+    # Read-only root; /tmp is DISK-backed emptyDir, sizeLimit 512 MiB as an
+    # eviction backstop. Pod ephemeral-storage requests/limits are 1 GiB.
+    # Every 100 ms the supervisor sums regular-file st_blocks*512 across ALL
+    # /tmp and /dev/shm: watchdog budget 256 MiB + one 100 ms write burst.
+    # gVisor gofer write throughput makes that burst small. Memory emptyDir
+    # sizeLimit is not enforced as a tmpfs size under gVisor; do not rely on it.
+    # /dev/shm remains Memory emptyDir sizeLimit 16 MiB and is watched too.
+    # /tmp is writable/executable for GnuCOBOL/gcc and the shared Java tools.
     resources:
       requests:
         cpu: "1"
         memory: 2Gi
-        # Disk-backed /tmp/ccb-* requests, candidate files and captured streams.
+        # Includes candidate files, runtime and log overhead.
         ephemeral-storage: 1Gi
       limits:
         cpu: "1"

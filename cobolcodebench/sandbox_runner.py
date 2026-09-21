@@ -45,6 +45,9 @@ while True:
     if time.monotonic() >= until:
         raise SystemExit(2)
     time.sleep(0.02)
+# This entire independent exec has a five-second KILL deadline, including
+# deletion. Never walk candidate-controlled directories in the signing exec.
+subprocess.run(["/bin/sh", "-c", "exec rm -rf -- /tmp/ccb-*"], check=True)
 '''
 QUIESCENCE_COMMAND = ["timeout", "-s", "KILL", "5s",
                       "/usr/local/bin/python3", "-I", "-c", UID_QUIESCENCE]
@@ -65,17 +68,18 @@ sys.stdout.write(json.dumps({"cwd": work, "key": key}))
 RUNNER = r'''
 import base64
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
 import os
 import resource
-import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 CANDIDATE_UID = 65532
@@ -101,8 +105,8 @@ def restrict_child():
         os._exit(125)
     if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
         os._exit(125)
-    # Set before dropping root; inherited by exec and all descendants. Prefer
-    # the candidate over the supervisor if a cgroup memory budget is exceeded.
+    # Useful on native Linux only: gVisor records this but ignores OOM priority.
+    # Aggregate RSS is independently bounded by the watchdog below.
     with open("/proc/self/oom_score_adj", "w") as oom_score:
         oom_score.write("1000")
     os.setgroups([])
@@ -129,6 +133,129 @@ def kill_group(pgid):
         if sig == signal.SIGTERM:
             time.sleep(0.1)
 
+
+
+def candidate_rss():
+    total = 0
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/status") as stream:
+                fields = dict(line.split(":", 1) for line in stream if ":" in line)
+            if fields["Uid"].split()[0] == str(CANDIDATE_UID):
+                # VmRSS is in KiB; zombies may have no VmRSS entry.
+                # gVisor counts shared copy-on-write pages in each process's
+                # VmRSS, so a 64-child fork storm can hit this aggregate cap.
+                # Legitimate compiler/JVM chains have only a handful of
+                # processes and stay far below the 768 MiB aggregate budget.
+                total += int(fields.get("VmRSS", "0 kB").split()[0]) * 1024
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return total
+
+
+def kill_candidate(pgid):
+    # Immediate KILL, without TERM grace or reaping in the watchdog thread.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/status") as stream:
+                fields = dict(line.split(":", 1) for line in stream if ":" in line)
+            if fields["Uid"].split()[0] == str(CANDIDATE_UID):
+                os.kill(int(name), signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
+
+def watch_memory(pgid, stopped, status):
+    try:
+        while not stopped.is_set():
+            if candidate_rss() > 768 * 1024**2:
+                status["memory_exceeded"] = True
+                kill_candidate(pgid)
+                return
+            stopped.wait(0.05)
+    except Exception:
+        status["supervisor_error"] = True
+        try:
+            kill_candidate(pgid)
+        except Exception:
+            status["cleanup_failed"] = True
+
+
+def candidate_disk_bytes(roots=("/tmp", "/dev/shm")):
+    total = 0
+    # Descriptor-relative traversal prevents a directory swapped for a symlink
+    # from redirecting the root supervisor. No file contents are opened.
+    def open_directory(path, parent=None):
+        try:
+            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                           dir_fd=parent)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                return None
+            raise
+
+    for root in roots:
+        fd = open_directory(root)
+        if fd is None:
+            continue
+        stack = []
+        try:
+            stack.append((fd, os.scandir(fd)))
+        except Exception:
+            os.close(fd)
+            raise
+        try:
+            while stack:
+                parent, entries = stack[-1]
+                entry = next(entries, None)
+                if entry is None:
+                    entries.close()
+                    os.close(parent)
+                    stack.pop()
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_blocks * 512
+                elif stat.S_ISDIR(info.st_mode):
+                    fd = open_directory(entry.name, parent)
+                    if fd is not None:
+                        try:
+                            stack.append((fd, os.scandir(fd)))
+                        except Exception:
+                            os.close(fd)
+                            raise
+        finally:
+            for fd, entries in stack:
+                entries.close()
+                os.close(fd)
+    return total
+
+
+def watch_disk(pgid, stopped, status):
+    try:
+        while not stopped.is_set():
+            if candidate_disk_bytes() > 256 * 1024**2:
+                status["disk_exceeded"] = True
+                kill_candidate(pgid)
+                return
+            stopped.wait(0.1)
+    except Exception:
+        status["supervisor_error"] = True
+        try:
+            kill_candidate(pgid)
+        except Exception:
+            status["cleanup_failed"] = True
 
 
 def sweep_uid():
@@ -175,10 +302,16 @@ def run_step(argv, timeout, candidate_work):
             stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
             start_new_session=True, preexec_fn=restrict_child,
         )
-        status = dict(returncode=125, timeout=False, overflow=False,
+        status = dict(returncode=125, timeout=False, overflow=False, memory_exceeded=False, disk_exceeded=False,
                       cleanup_failed=False, supervisor_error=False)
         output = b""
+        stopped = threading.Event()
+        watchdogs = [threading.Thread(target=watcher, args=(child.pid, stopped, status), daemon=True)
+                     for watcher in (watch_memory, watch_disk)]
         try:
+            # Start after Popen: preexec_fn must not fork a threaded supervisor.
+            for watchdog in watchdogs:
+                watchdog.start()
             status["returncode"] = child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             status["timeout"] = True
@@ -198,6 +331,14 @@ def run_step(argv, timeout, candidate_work):
                 sweep_uid()
             except Exception:
                 status["cleanup_failed"] = True
+            stopped.set()
+            for watchdog in watchdogs:
+                try:
+                    watchdog.join(timeout=0.2)
+                    if watchdog.is_alive():
+                        status["supervisor_error"] = True
+                except Exception:
+                    status["supervisor_error"] = True
         try:
             stdout.seek(0)
             output = stdout.read(limit + 1)
@@ -207,7 +348,7 @@ def run_step(argv, timeout, candidate_work):
         return status, output
 
 
-status = dict(returncode=125, timeout=False, overflow=False,
+status = dict(returncode=125, timeout=False, overflow=False, memory_exceeded=False, disk_exceeded=False,
               cleanup_failed=False, supervisor_error=False)
 stage = "compile"
 compile_success = False
@@ -234,13 +375,13 @@ try:
     status, output = run_step(request["argv"], request["timeout"], candidate_work)
     stage = "compile"
     compile_success = (status["returncode"] == 0 and not any(status[flag] for flag in
-                       ("timeout", "overflow", "cleanup_failed", "supervisor_error")))
+                       ("timeout", "overflow", "memory_exceeded", "disk_exceeded", "cleanup_failed", "supervisor_error")))
     outputs = {}
     if compile_success and "run_argv" in request:
         stage = "run"
         status, output = run_step(request["run_argv"], request["run_timeout"], candidate_work)
         if status["returncode"] == 0 and not any(status[flag] for flag in
-                ("timeout", "overflow", "cleanup_failed", "supervisor_error")):
+                ("timeout", "overflow", "memory_exceeded", "disk_exceeded", "cleanup_failed", "supervisor_error")):
             total_bytes = 0
             for name in request.get("output_files", []):
                 if not name or name in {".", ".."} or os.path.basename(name) != name:
@@ -265,14 +406,11 @@ except Exception:
     # Exception text can contain candidate bytes; publish only a signed flag.
     status["supervisor_error"] = True
 finally:
-    try:
-        shutil.rmtree(work)
-    except Exception:
-        status["cleanup_failed"] = True
     body = json.dumps({**status, "stage": stage, "compile_success": compile_success,
                       "outputs": outputs,
                       "output": base64.b64encode(output).decode("ascii"), "cwd": work}, separators=(",", ":"))
     tag = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
     sys.stdout.write(json.dumps({"body": body, "tag": tag}))
     sys.stdout.flush()
+    os._exit(0)
 '''

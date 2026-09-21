@@ -46,6 +46,8 @@ def file_scorer(mode: str):
         # inside one root supervisor; no candidate-controlled driver verdict.
         deadline = payload['timeout'] + payload['run_timeout'] + 10
         receipt = None
+        signed_failure = None
+        cleanup_failed = False
         cleanup_after = 0
         try:
             with private_grading(env) as private:
@@ -76,6 +78,8 @@ def file_scorer(mode: str):
                             )
                         receipt = verify_receipt(result.stdout, key)
                         if receipt is not None and receipt["cwd"] == work:
+                            # Decide authenticated failure before independent cleanup.
+                            signed_failure = receipt_failure(receipt)
                             # Authenticated completion means no later spawn;
                             # sweep immediately before starting the next test.
                             cleanup_after = 0
@@ -94,6 +98,13 @@ def file_scorer(mode: str):
                     except asyncio.CancelledError:
                         await cleanup
                         raise
+                    except Exception:
+                        # The pod is per-sample and discarded afterwards; there is
+                        # no reuse across samples. Cleanup cannot erase a signed
+                        # failure or turn candidate misbehaviour into a harness error.
+                        if receipt is None:
+                            raise
+                        cleanup_failed = True
         except Exception:
             # Provider exceptions may embed stdin or captured output. Do not
             # allow them (or their exception chain) into an Inspect error event.
@@ -102,9 +113,10 @@ def file_scorer(mode: str):
         if receipt is None:
             raise RuntimeError("Private sandbox operation failed; details withheld.") from None
         compiled = receipt['compile_success']
-        failure = receipt_failure(receipt)
-        if failure is not None:
-            return verdict(failure, compiled)
+        if signed_failure is not None:
+            return verdict(signed_failure, compiled)
+        if cleanup_failed:
+            return verdict('candidate left processes that could not be cleaned up', compiled)
         expected = json.loads(record['outputs'])
         correct, diagnostic, count = compare_outputs(receipt['outputs'], expected)
         return verdict(f'{count}/{len(expected)} output files match exactly', compiled,
@@ -123,7 +135,7 @@ def file_scorer(mode: str):
 
 
 async def cleanup_candidate(environment, not_before: float = 0) -> None:
-    """Trusted, independent UID sweep; never proceed if cleanup itself fails."""
+    """Bounded independent UID sweep and directory deletion; stop on failure."""
     try:
         delay = not_before - asyncio.get_running_loop().time()
         if delay > 0:
@@ -141,5 +153,5 @@ async def cleanup_candidate(environment, not_before: float = 0) -> None:
         if checked.returncode != 0:
             raise RuntimeError("UID cleanup did not reach quiescence")
     except Exception:
-        # In particular do not turn a cleanup timeout into a candidate verdict.
+        # The caller preserves authenticated verdicts, including on timeout.
         raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None

@@ -17,11 +17,24 @@ spec:
   automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
   restartPolicy: Never
   enableServiceLinks: false
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 512Mi
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi
   containers:
     - name: default
       image: {{ $service.image }}
       command: {{ $service.command | toJson }}
       workingDir: {{ $service.workingDir }}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: shm
+          mountPath: /dev/shm
       securityContext:
         {{- toYaml $service.securityContext | nindent 8 }}
       resources:
