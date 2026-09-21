@@ -15,6 +15,9 @@ def test_cloudbuild_provides_reference_image_and_docker_socket():
     assert config['substitutions']['_SANDBOX_IMAGE'] == regression.IMAGE
     command = step['args'][-1]
     assert '/var/run/docker.sock:/var/run/docker.sock' in command
+    assert '--cap-drop=ALL' in command
+    for capability in ('SETUID', 'SETGID', 'KILL', 'CHOWN', 'DAC_OVERRIDE', 'SYS_PTRACE'):
+        assert '--cap-add=' + capability in command
     assert 'scripts/linux_regressions.py' in command
     assert '--docker-cli /workspace/.build/docker' in command
     assert "--image '${_SANDBOX_IMAGE}'" in command
@@ -23,8 +26,10 @@ def test_cloudbuild_provides_reference_image_and_docker_socket():
 def test_nested_memory_container_budget():
     command = regression.memory_command('reference@sha256:fixture')
     for argument in ('--memory=2g', '--memory-swap=2g', '--pids-limit=128',
-                     '--read-only', '--volume', '/tmp', '--shm-size=16m',
-                     '--user=0:0', '--memory-only', 'reference@sha256:fixture'):
+                     '--read-only', '--volume', '/tmp', '--tmpfs', '/dev/shm:ro,size=16m',
+                     '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL',
+                     '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=SYS_PTRACE',
+                     '--security-opt=no-new-privileges:true', '--user=0:0', '--memory-only', 'reference@sha256:fixture'):
         assert argument in command
     assert '/var/run/docker.sock:/var/run/docker.sock' not in command
 
@@ -40,7 +45,7 @@ def test_real_regression_orchestration_and_private_logging(monkeypatch, capsys, 
 
     def checked_run(command, **kwargs):
         assert command == regression.memory_command(regression.IMAGE)
-        return SimpleNamespace(stdout='\n'.join([json.dumps(report)] * 3))
+        return SimpleNamespace(stdout='\n'.join([json.dumps(report)] * len(regression.BOUNDED_CASES)))
 
     monkeypatch.setattr(regression, 'run_case', run_case)
     monkeypatch.setattr(regression, 'checked_run', checked_run)
@@ -52,7 +57,7 @@ def test_real_regression_orchestration_and_private_logging(monkeypatch, capsys, 
     assert calls == [('bytes', False), ('forks', False)] + ([] if docker else [('memory', True)])
     output = capsys.readouterr()
     assert not output.err
-    assert [json.loads(line) for line in output.out.splitlines()] == [report] * (5 if docker else 3)
+    assert [json.loads(line) for line in output.out.splitlines()] == [report] * (2 + len(regression.BOUNDED_CASES) if docker else 3)
 
 
 def test_script_imports_exact_production_sources_without_inspect():
@@ -112,13 +117,13 @@ def test_bounded_docker_cases_include_aggregate_memory_and_disk(monkeypatch, cap
     monkeypatch.setattr(regression.os, 'geteuid', lambda: 0)
     monkeypatch.setattr(regression.sys, 'argv', ['linux_regressions.py', '--memory-only'])
     assert regression.main() == 0
-    assert calls == ['memory', 'memory_aggregate', 'disk']
-    assert len(capsys.readouterr().out.splitlines()) == 3
+    assert calls == list(regression.BOUNDED_CASES)
+    assert len(capsys.readouterr().out.splitlines()) == len(regression.BOUNDED_CASES)
 
 
 def test_disk_case_exceeds_aggregate_disk_not_single_file_limit():
     request = regression.case_request('disk')
-    assert request['output_limit'] == 2 * 1024**2
+    assert request['output_limit'] == 1024**2
     assert '1024 * 1024' in request['run_argv'][-1]
     assert 'while True:' in request['run_argv'][-1]
     assert "dir='/tmp'" in request['run_argv'][-1]
@@ -130,5 +135,35 @@ def test_disk_case_exceeds_aggregate_disk_not_single_file_limit():
 def test_explicit_docker_cli_is_used():
     command = regression.memory_command('reference', '/workspace/.build/docker')
     assert command[0] == '/workspace/.build/docker'
-    assert '--tmpfs' not in command
+    assert command[command.index('--tmpfs') + 1] == '/dev/shm:ro,size=16m'
     assert command[command.index('--volume') + 1] == '/tmp'
+
+
+@pytest.mark.parametrize('name', ['disk_unlinked', 'disk_memfd', 'disk_entries', 'shm_readonly'])
+def test_new_cases_are_required_in_docker_and_production(name):
+    from scripts.k8s_regressions import CASES
+    assert name in regression.BOUNDED_CASES and name in CASES
+    receipt = dict(stage='run', compile_success=True, returncode=1, output='',
+                   **{flag: False for flag in regression.FLAGS})
+    if name in regression.DISK_CASES:
+        receipt['disk_exceeded'] = True
+    assert regression.expected_receipt(name, receipt)
+    for changes in ({'returncode': 0}, {'timeout': True}, {'supervisor_error': True},
+                    {'disk_exceeded': not receipt['disk_exceeded']}):
+        assert not regression.expected_receipt(name, {**receipt, **changes})
+    compile(regression.case_request(name)['run_argv'][-1], '<candidate>', 'exec')
+
+
+def test_ptrace_denial_requires_signed_nonzero_permission_witness():
+    from scripts.k8s_regressions import CASES
+    assert 'ptrace_denied' in regression.BOUNDED_CASES and 'ptrace_denied' in CASES
+    code = regression.CASES['ptrace_denied']
+    assert "os.stat('/proc/1/fd/0')" in code
+    assert 'except PermissionError:' in code
+    receipt = dict(stage='run', compile_success=True, returncode=1, output='ptrace-denied\n',
+                   **{flag: False for flag in regression.FLAGS})
+    assert regression.expected_receipt('ptrace_denied', receipt)
+    for changes in ({'returncode': 0}, {'returncode': 2}, {'output': ''},
+                    {'supervisor_error': True}, {'timeout': True}):
+        assert not regression.expected_receipt('ptrace_denied', {**receipt, **changes})
+    compile(regression.case_request('ptrace_denied')['run_argv'][-1], '<candidate>', 'exec')

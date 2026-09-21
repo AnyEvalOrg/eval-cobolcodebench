@@ -52,16 +52,101 @@ subprocess.run(["/bin/sh", "-c", "exec rm -rf -- /tmp/ccb-*"], check=True)
 QUIESCENCE_COMMAND = ["timeout", "-s", "KILL", "5s",
                       "/usr/local/bin/python3", "-I", "-c", UID_QUIESCENCE]
 
+# Shared verbatim by the prerequisite probe and every candidate launch.
+RESTRICT_CHILD = r'''
+def restrict_child(nofile=256):
+    # No parent-death signal is trusted: the scorer independently kills this UID.
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        os._exit(125)
+    if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
+        os._exit(125)
+    # Useful on native Linux only: gVisor records this but ignores OOM priority.
+    # Aggregate RSS is independently bounded by the watchdog below.
+    with open("/proc/self/oom_score_adj", "w") as oom_score:
+        oom_score.write("1000")
+    os.setgroups([])
+    os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)
+    os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
+    # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
+    # These hard limits and the irreversible credential drop survive exec.
+    resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
+    # Half the production pod's 2 GiB budget leaves supervisor headroom.
+    resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))
+    resource.setrlimit(resource.RLIMIT_DATA, (1024**3, 1024**3))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+'''
+
 # Setup runs before any candidate exists. Both execs are bounded by the scorer.
 SETUP = r'''
-import json, os, secrets, sys, tempfile
-request = json.load(sys.stdin)
-key = secrets.token_hex(32)
-request["key"] = key
-work = tempfile.mkdtemp(prefix="ccb-", dir="/tmp")
-with open(os.path.join(work, "request.json"), "x", encoding="utf-8") as f:
-    json.dump(request, f)
-sys.stdout.write(json.dumps({"cwd": work, "key": key}))
+import ctypes, json, os, resource, secrets, shutil, subprocess, sys, tempfile
+libc = ctypes.CDLL(None, use_errno=True)
+CANDIDATE_UID = 65532
+CANDIDATE_GID = 65532
+limit = 4096
+''' + RESTRICT_CHILD + r'''
+
+
+def check_prerequisites(work):
+    # No candidate bytes run here. Exercise the actual cross-UID /proc access
+    # and executable work mount before issuing a key or launching a compiler.
+    if os.getuid() != 0 or libc.prctl(4, 0, 0, 0, 0) != 0:
+        raise RuntimeError()
+    os.listdir("/proc")
+    with open("/proc/self/oom_score_adj", "r+") as stream:
+        value = stream.read()
+        stream.seek(0)
+        stream.write(value)
+    probe = tempfile.mkdtemp(prefix="probe-", dir=work)
+    child = None
+    try:
+        os.chown(probe, CANDIDATE_UID, CANDIDATE_GID)
+        os.chmod(work, 0o711)
+        script = os.path.join(probe, "executable")
+        with open(script, "x", encoding="utf-8") as stream:
+            stream.write("#!/bin/sh\n: > writable\n")
+        os.chmod(script, 0o755)
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(2)"],
+            cwd=probe, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, preexec_fn=restrict_child,
+        )
+        os.stat("/proc/" + str(child.pid) + "/fd/0")
+        with open("/proc/" + str(child.pid) + "/status") as stream:
+            fields = dict(line.split(":", 1) for line in stream if ":" in line)
+        if (fields["Uid"].split() != [str(CANDIDATE_UID)] * 4
+                or int(fields["VmRSS"].split()[0]) < 0):
+            raise RuntimeError()
+        subprocess.run(
+            [script], cwd=probe, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, preexec_fn=restrict_child, check=True, timeout=1,
+        )
+        if os.stat(os.path.join(probe, "writable")).st_uid != CANDIDATE_UID:
+            raise RuntimeError()
+    finally:
+        try:
+            if child is not None:
+                child.kill()
+                child.wait(timeout=1)
+        finally:
+            os.chmod(work, 0o700)
+            shutil.rmtree(probe)
+
+
+try:
+    request = json.load(sys.stdin)
+    work = tempfile.mkdtemp(prefix="ccb-", dir="/tmp")
+    check_prerequisites(work)
+    key = secrets.token_hex(32)
+    request["key"] = key
+    with open(os.path.join(work, "request.json"), "x", encoding="utf-8") as f:
+        json.dump(request, f)
+    sys.stdout.write(json.dumps({"cwd": work, "key": key}))
+except Exception:
+    # Fixed text only: provider diagnostics and request bytes stay private.
+    raise SystemExit("Sandbox setup failed; details withheld.") from None
 '''
 
 # Kept as source: importing this module never starts a process or executes code.
@@ -99,27 +184,7 @@ key = bytes.fromhex(request.pop("key"))
 limit = request["output_limit"]
 
 
-def restrict_child():
-    # No parent-death signal is trusted: the scorer independently kills this UID.
-    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
-        os._exit(125)
-    if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
-        os._exit(125)
-    # Useful on native Linux only: gVisor records this but ignores OOM priority.
-    # Aggregate RSS is independently bounded by the watchdog below.
-    with open("/proc/self/oom_score_adj", "w") as oom_score:
-        oom_score.write("1000")
-    os.setgroups([])
-    os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)
-    os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
-    # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
-    # These hard limits and the irreversible credential drop survive exec.
-    resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
-    # Half the production pod's 2 GiB budget leaves supervisor headroom.
-    resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))
-    resource.setrlimit(resource.RLIMIT_DATA, (1024**3, 1024**3))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+''' + RESTRICT_CHILD + r'''
 
 
 def kill_group(pgid):
@@ -150,7 +215,7 @@ def candidate_rss():
                 # Legitimate compiler/JVM chains have only a handful of
                 # processes and stay far below the 768 MiB aggregate budget.
                 total += int(fields.get("VmRSS", "0 kB").split()[0]) * 1024
-        except (FileNotFoundError, ProcessLookupError):
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
             pass
     return total
 
@@ -169,7 +234,7 @@ def kill_candidate(pgid):
                 fields = dict(line.split(":", 1) for line in stream if ":" in line)
             if fields["Uid"].split()[0] == str(CANDIDATE_UID):
                 os.kill(int(name), signal.SIGKILL)
-        except (FileNotFoundError, ProcessLookupError):
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
             pass
 
 
@@ -189,49 +254,88 @@ def watch_memory(pgid, stopped, status):
             status["cleanup_failed"] = True
 
 
-def candidate_disk_bytes(roots=("/tmp", "/dev/shm")):
+def candidate_disk_bytes(roots=("/tmp", "/var/tmp", "/dev/shm"), stopped=None,
+                         proc_root="/proc"):
+    # Return budget + 1 for either byte or inode exhaustion. Cancellation returns
+    # the partial count; no complete traversal is needed on the signing path.
+    budget = 256 * 1024**2
     total = 0
+    count = 0
+    seen = {}
+
+    def cancelled():
+        return stopped is not None and stopped.is_set()
+
+    def account(info):
+        nonlocal total
+        if stat.S_ISREG(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            size = info.st_blocks * 512
+            previous = seen.get(identity, 0)
+            # Count hardlinks, inherited descriptors and visible files once,
+            # but include growth observed between the tree and descriptor scans.
+            total += max(0, size - previous)
+            seen[identity] = max(size, previous)
+
     # Descriptor-relative traversal prevents a directory swapped for a symlink
     # from redirecting the root supervisor. No file contents are opened.
     def open_directory(path, parent=None):
         try:
             return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                            dir_fd=parent)
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            return None
         except OSError as exc:
-            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            if exc.errno in (errno.ENOTDIR, errno.ELOOP):
                 return None
             raise
 
     for root in roots:
+        if cancelled():
+            return total
         fd = open_directory(root)
         if fd is None:
             continue
         stack = []
         try:
             stack.append((fd, os.scandir(fd)))
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            os.close(fd)
+            continue
         except Exception:
             os.close(fd)
             raise
         try:
             while stack:
+                if cancelled():
+                    return total
                 parent, entries = stack[-1]
-                entry = next(entries, None)
+                try:
+                    entry = next(entries, None)
+                except (PermissionError, FileNotFoundError, ProcessLookupError):
+                    entry = None
                 if entry is None:
                     entries.close()
                     os.close(parent)
                     stack.pop()
                     continue
+                count += 1
+                if count > 10000:
+                    return budget + 1
                 try:
                     info = entry.stat(follow_symlinks=False)
-                except FileNotFoundError:
+                except (PermissionError, FileNotFoundError, ProcessLookupError):
                     continue
-                if stat.S_ISREG(info.st_mode):
-                    total += info.st_blocks * 512
-                elif stat.S_ISDIR(info.st_mode):
+                account(info)
+                if total > budget:
+                    return total
+                if stat.S_ISDIR(info.st_mode):
                     fd = open_directory(entry.name, parent)
                     if fd is not None:
                         try:
                             stack.append((fd, os.scandir(fd)))
+                        except (PermissionError, FileNotFoundError, ProcessLookupError):
+                            os.close(fd)
                         except Exception:
                             os.close(fd)
                             raise
@@ -239,13 +343,37 @@ def candidate_disk_bytes(roots=("/tmp", "/dev/shm")):
             for fd, entries in stack:
                 entries.close()
                 os.close(fd)
+    # /proc magic links expose even unlinked files and anonymous memfds.
+    # The candidate's hard NOFILE and NPROC limits bound this scan.
+    for name in os.listdir(proc_root):
+        if cancelled():
+            return total
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, name, "status")) as stream:
+                fields = dict(line.split(":", 1) for line in stream if ":" in line)
+            if fields["Uid"].split()[0] != str(CANDIDATE_UID):
+                continue
+            with os.scandir(os.path.join(proc_root, name, "fd")) as descriptors:
+                for descriptor in descriptors:
+                    if cancelled():
+                        return total
+                    try:
+                        account(os.stat(descriptor.path))
+                    except (PermissionError, FileNotFoundError, ProcessLookupError):
+                        continue
+                    if total > budget:
+                        return total
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            pass
     return total
 
 
 def watch_disk(pgid, stopped, status):
     try:
         while not stopped.is_set():
-            if candidate_disk_bytes() > 256 * 1024**2:
+            if candidate_disk_bytes(stopped=stopped) > 256 * 1024**2:
                 status["disk_exceeded"] = True
                 kill_candidate(pgid)
                 return
@@ -295,12 +423,15 @@ def sweep_uid():
 def run_step(argv, timeout, candidate_work):
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) for x in argv):
         raise ValueError("argv must be a nonempty string list")
+    java_step = os.path.basename(argv[0]) in {"java", "javac"}
+    child_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": candidate_work,
+                 "TMPDIR": candidate_work, "JAVA_TOOL_OPTIONS": "-XX:-UsePerfData"}
     with tempfile.TemporaryFile(dir=work) as stdout, tempfile.TemporaryFile(dir=work) as stderr:
         child = subprocess.Popen(
             argv, cwd=candidate_work,
-            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": candidate_work, "TMPDIR": candidate_work},
+            env=child_env,
             stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
-            start_new_session=True, preexec_fn=restrict_child,
+            start_new_session=True, preexec_fn=lambda: restrict_child(1024 if java_step else 256),
         )
         status = dict(returncode=125, timeout=False, overflow=False, memory_exceeded=False, disk_exceeded=False,
                       cleanup_failed=False, supervisor_error=False)
@@ -318,6 +449,16 @@ def run_step(argv, timeout, candidate_work):
         except Exception:
             status["supervisor_error"] = True
         finally:
+            # Cancel filesystem work immediately, before cleanup. Never wait for
+            # a complete scan: even a blocked syscall cannot delay signing.
+            stopped.set()
+            for watchdog in watchdogs:
+                try:
+                    watchdog.join(timeout=0.2)
+                    if watchdog.is_alive():
+                        status["supervisor_error"] = True
+                except Exception:
+                    status["supervisor_error"] = True
             # Each post-exit operation is isolated: none may suppress signing.
             try:
                 kill_group(child.pid)
@@ -331,14 +472,6 @@ def run_step(argv, timeout, candidate_work):
                 sweep_uid()
             except Exception:
                 status["cleanup_failed"] = True
-            stopped.set()
-            for watchdog in watchdogs:
-                try:
-                    watchdog.join(timeout=0.2)
-                    if watchdog.is_alive():
-                        status["supervisor_error"] = True
-                except Exception:
-                    status["supervisor_error"] = True
         try:
             stdout.seek(0)
             output = stdout.read(limit + 1)

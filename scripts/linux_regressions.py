@@ -33,6 +33,14 @@ def load_module(name):
 
 
 CASES = {
+    'ptrace_denied': '''import os
+try:
+    os.stat('/proc/1/fd/0')
+except PermissionError:
+    print('ptrace-denied', flush=True)
+    raise SystemExit(1)
+raise SystemExit(0)
+''',
     'bytes': "import os; os.write(1, b'\\xff'); raise SystemExit(1)",
     'forks': '''import os, time
 children = 0
@@ -77,6 +85,56 @@ while True:
         stream.write(block)
     i += 1
 ''',
+    'disk_unlinked': '''import os, tempfile, time
+for _ in range(4):
+    if os.fork() == 0:
+        os.setsid()
+        retained = []
+        block = b'x' * (1024 * 1024)
+        for _ in range(75):
+            fd, path = tempfile.mkstemp(prefix='ccb-unlinked-', dir='/tmp')
+            os.unlink(path)
+            retained.append(fd)
+            remaining = block
+            while remaining:
+                remaining = remaining[os.write(fd, remaining):]
+        time.sleep(60)
+        os._exit(0)
+time.sleep(60)
+''',
+    'disk_memfd': '''import os, time
+# Split across four workers to respect native NOFILE=256 and FSIZE=1 MiB.
+for _ in range(4):
+    if os.fork() == 0:
+        os.setsid()
+        retained = []
+        block = b'x' * (1024 * 1024)
+        for _ in range(75):
+            fd = os.memfd_create('candidate')
+            retained.append(fd)
+            remaining = block
+            while remaining:
+                remaining = remaining[os.write(fd, remaining):]
+        time.sleep(60)
+        os._exit(0)
+time.sleep(60)
+''',
+    'disk_entries': '''import os, tempfile, time
+other = tempfile.mkdtemp(prefix='ccb-entries-', dir='/tmp')
+for i in range(50000):
+    open(os.path.join(other, str(i)), 'wb').close()
+time.sleep(60)
+''',
+    'shm_readonly': '''import errno, os
+try:
+    fd = os.open('/dev/shm/candidate-write', os.O_CREAT | os.O_WRONLY, 0o600)
+except OSError as exc:
+    if exc.errno == errno.EROFS:
+        raise SystemExit(1)
+    raise SystemExit(2)
+os.close(fd)
+raise SystemExit(0)
+''',
     'detached': '''import os, time
 read_fd, write_fd = os.pipe()
 if os.fork() == 0:
@@ -93,9 +151,13 @@ os.close(read_fd)
 }
 
 
+DISK_CASES = ('disk', 'disk_unlinked', 'disk_memfd', 'disk_entries')
+BOUNDED_CASES = ('memory', 'memory_aggregate', *DISK_CASES, 'shm_readonly', 'ptrace_denied', 'detached')
+
 LIMIT_PROBE = '''import os, resource
 assert os.getresuid() == (65532,) * 3
 assert resource.getrlimit(resource.RLIMIT_NPROC) == (64, 64)
+assert resource.getrlimit(resource.RLIMIT_NOFILE) == (256, 256)
 assert resource.getrlimit(resource.RLIMIT_AS) == (1024**3, 1024**3)
 assert resource.getrlimit(resource.RLIMIT_DATA) == (1024**3, 1024**3)
 assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
@@ -113,7 +175,7 @@ def checked_run(command, **kwargs):
 
 def case_request(name, executable='/usr/local/bin/python3'):
     # Each disk file must fit below FSIZE so this reaches the aggregate disk watchdog.
-    limit = 2 * 1024 * 1024 if name == 'disk' else 4096
+    limit = 1024 * 1024 if name in DISK_CASES else 4096
     probe = LIMIT_PROBE.replace('(4096, 4096)', f'({limit}, {limit})')
     return dict(files={}, argv=[executable, '-I', '-c', 'pass'],
                 run_argv=[executable, '-I', '-c', probe + CASES[name]],
@@ -131,15 +193,20 @@ def expected_receipt(name, receipt):
         return False
     if name not in {'memory', 'memory_aggregate', 'forks'} and receipt.get('memory_exceeded', False):
         return False
-    if name != 'disk' and receipt.get('disk_exceeded', False):
+    if name not in DISK_CASES and receipt.get('disk_exceeded', False):
         return False
+    if name == 'ptrace_denied':
+        return (receipt['returncode'] == 1 and receipt['output'] == 'ptrace-denied\n'
+                and not any(receipt.get(f, False) for f in FLAGS))
+    if name == 'shm_readonly':
+        return receipt['returncode'] == 1 and not any(receipt.get(f, False) for f in FLAGS)
     if name == 'bytes':
         return receipt['output_not_decodable']
     if receipt['output_not_decodable']:
         return False
     if name == 'memory_aggregate':
         return receipt.get('memory_exceeded', False)
-    if name == 'disk':
+    if name in DISK_CASES:
         return receipt.get('disk_exceeded', False)
     if name == 'forks':
         # gVisor charges shared copy-on-write RSS once per child.
@@ -180,8 +247,10 @@ def run_case(name, *, prlimit=False):
 
 def memory_command(image, docker_cli='docker'):
     return [docker_cli, 'run', '--rm', '--memory=2g', '--memory-swap=2g',
-            '--read-only', '--volume', '/tmp', '--shm-size=16m',
-            '--pids-limit=128', '--network=none', '--user=0:0',
+            '--read-only', '--volume', '/tmp', '--tmpfs', '/dev/shm:ro,size=16m',
+            '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID',
+            '--cap-add=KILL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE',
+            '--cap-add=SYS_PTRACE', '--security-opt=no-new-privileges:true', '--pids-limit=128', '--network=none', '--user=0:0',
             '-v', f'{ROOT}:{ROOT}:ro', '-w', str(ROOT), image,
             '/usr/local/bin/python3', str(ROOT / 'scripts/linux_regressions.py'), '--memory-only']
 
@@ -196,12 +265,12 @@ def main():
         parser.error('requires root in a disposable Linux reference sandbox image')
     try:
         if args.memory_only:
-            reports = [run_case(name) for name in ('memory', 'memory_aggregate', 'disk')]
+            reports = [run_case(name) for name in BOUNDED_CASES]
         else:
             reports = [run_case(name) for name in ('bytes', 'forks')]
             if shutil.which(args.docker_cli):
                 # A present but broken daemon is a failure, never a silent fallback.
-                result = checked_run(memory_command(args.image, args.docker_cli), timeout=90)
+                result = checked_run(memory_command(args.image, args.docker_cli), timeout=300)
                 reports.extend(json.loads(line) for line in result.stdout.splitlines())
             else:
                 if args.docker_cli != 'docker':

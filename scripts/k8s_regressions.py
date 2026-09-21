@@ -27,9 +27,9 @@ from cobolcodebench.receipts import verify_receipt
 from cobolcodebench.sandbox_runner import RUNNER, SETUP
 from cobolcodebench.scoring import cleanup_candidate
 from cobolcodebench.task import task_sandbox
-from scripts.linux_regressions import FLAGS, case_request, expected_receipt
+from scripts.linux_regressions import DISK_CASES, FLAGS, case_request, expected_receipt
 
-CASES = ('bytes', 'forks', 'memory_aggregate', 'disk', 'detached')
+CASES = ('bytes', 'forks', 'memory_aggregate', *DISK_CASES, 'shm_readonly', 'ptrace_denied', 'detached')
 
 
 async def run_case(environment, name):
@@ -42,6 +42,8 @@ async def run_case(environment, name):
                 ['timeout', '-s', 'KILL', '5s', '/usr/local/bin/python3', '-I', '-c', SETUP],
                 cwd='/', input=json.dumps(case_request(name)), timeout=5, timeout_retry=False,
             )
+        if setup_result.returncode != 0:
+            raise RuntimeError("Sandbox setup failed")
         setup = json.loads(setup_result.stdout)
         work, key = setup['cwd'], bytes.fromhex(setup['key'])
         if len(key) != 32 or not re.fullmatch(r'/tmp/ccb-[a-zA-Z0-9_-]+', work):

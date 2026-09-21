@@ -515,3 +515,19 @@ def test_actual_runner_invalid_utf8_scores_incorrect(monkeypatch, code):
     score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
     assert score.value == INCORRECT
     assert 'output not decodable' in score.explanation
+
+
+@pytest.mark.parametrize('stdout', ['', json.dumps({'cwd': '/tmp/ccb-probe', 'key': 'ab' * 32})])
+def test_nonzero_prerequisite_setup_is_withheld_harness_error(monkeypatch, stdout):
+    class FailedPrerequisite(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd:
+                self.calls.append((cmd, kwargs))
+                return result(stdout, returncode=1)
+            return await super().exec(cmd, **kwargs)
+
+    fake = FailedPrerequisite([])
+    install_sandbox(monkeypatch, fake)
+    assert_sample_error()
+    assert not any(scoring.RUNNER in cmd for cmd, _ in fake.calls)
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND

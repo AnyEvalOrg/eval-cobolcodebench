@@ -7,9 +7,18 @@ services:
     command: ["sleep", "infinity"]
     working_dir: /tmp
     user: "0:0"
+    read_only: true
+    # Anonymous disk-backed volume; Compose has no portable disk size quota.
+    # The supervisor's byte and entry watchdog is the bound.
+    volumes:
+      - /tmp
+    tmpfs:
+      - /dev/shm:ro,size=16m
     network_mode: none
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE]
+    # Cross-UID /proc/fd accounting requires SYS_PTRACE in the supervisor.
+    # restrict_child clears permitted/effective capabilities before exec.
+    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE, SYS_PTRACE]
     security_opt:
       - no-new-privileges:true
     mem_limit: 2g

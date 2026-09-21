@@ -8,5 +8,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 cobol-candidate \
     && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin cobol-candidate
+ENV JAVA_TOOL_OPTIONS="-XX:-UsePerfData"
 USER 0:0
 RUN command -v dmesg && command -v hostname && cobc --version && javac -version && java -version && python3 --version

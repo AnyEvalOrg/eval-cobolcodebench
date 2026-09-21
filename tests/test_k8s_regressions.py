@@ -61,11 +61,13 @@ class RegressionSandbox:
         if RUNNER in cmd:
             assert cmd[-1] == self.work and kwargs['timeout'] == 30
             body = dict(stage='run', cwd=self.work, compile_success=True, outputs={},
-                        returncode=0 if self.name == 'detached' else -9 if self.name == 'disk' else 1,
+                        returncode=0 if self.name == 'detached' else -9 if self.name in regression.DISK_CASES else 1,
                         **{flag: False for flag in regression.FLAGS if flag != 'output_not_decodable'})
             body['memory_exceeded'] = self.name == 'memory_aggregate'
-            body['disk_exceeded'] = self.name == 'disk'
+            body['disk_exceeded'] = self.name in regression.DISK_CASES
             output = b'\xff' if self.name == 'bytes' else b'forks-exhausted 63\n' if self.name == 'forks' else b''
+            if self.name == 'ptrace_denied':
+                output = b'ptrace-denied\n'
             body['output'] = base64.b64encode(output).decode()
             body.update(self.changes)
             body = json.dumps(body)
@@ -94,6 +96,8 @@ def test_real_protocol_authenticates_expected_cases_and_probes_same_pod(name):
     ('memory_aggregate', {'memory_exceeded': False}),
     ('disk', {'disk_exceeded': False}), ('disk', {'returncode': 0}),
     ('detached', {'cleanup_failed': True}), ('bytes', {'output': ''}),
+    ('ptrace_denied', {'returncode': 0}), ('ptrace_denied', {'returncode': 2}),
+    ('ptrace_denied', {'output': ''}),
     ('forks', {'timeout': True}), ('forks', {'output': ''}),
     ('forks', {'output': base64.b64encode(b'forks-exhausted 0\n').decode()}),
     ('forks', {'output': base64.b64encode(b'forks-exhausted 64\n').decode()}),

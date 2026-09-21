@@ -144,28 +144,64 @@ protected root supervisor memory, authenticated receipts, independent UID
 sweeps, process/memory/file-size limits, and cleanup on cancellation or provider
 failure. Both `cobc` and generated executables have hard `RLIMIT_NPROC=64`
 (below the runtime's 128 PID limit), `RLIMIT_AS=RLIMIT_DATA=1 GiB`, and
-`RLIMIT_CORE=0`. Before dropping privileges, the supervisor sets the child's
+`RLIMIT_CORE=0`. Candidate `RLIMIT_NOFILE` is 256 for native steps and 1024
+for directly invoked `java`/`javac` steps, bounding descriptor scans to at most
+64 × 256 (Java: 64 × 1024) descriptors. Before dropping privileges, the supervisor sets the child's
 `oom_score_adj=1000`, inherited by descendants; gVisor records this value but
 does not use it to choose OOM victims. A supervisor watchdog sums `VmRSS` from
 `/proc/<pid>/status` for every UID 65532 process every 50 ms during each step.
 Above 768 MiB it kills the candidate group and detached descendants and signs
 `memory_exceeded=true`, scored `INCORRECT` with reason `memory limit exceeded`.
 The pod requests and limits are both 2 GiB, leaving headroom for a 50 ms
-allocation burst, file page cache, shared memory and the supervisor. gVisor
+allocation burst, file page cache, descriptor-retained memfds and the supervisor. gVisor
 counts shared copy-on-write RSS per process, so a fork storm may trigger this
 watchdog before exhausting NPROC; either outcome is a signed `INCORRECT`.
-The root filesystem is read-only. `/tmp` is a disk-backed emptyDir with a
-512 MiB sizeLimit as an eviction backstop; the pod's ephemeral-storage budget
-is 1 GiB. `/dev/shm` remains a Memory emptyDir with sizeLimit 16 MiB.
-A second watchdog walks **all** of `/tmp` and `/dev/shm` every 100 ms,
-summing `st_blocks * 512` for regular files without following symlinks. Above
-256 MiB it uses the same candidate kill path and signs `disk_exceeded=true`,
-scored `INCORRECT` with reason `disk limit exceeded`. Allow one 100 ms write
-burst beyond the budget; gVisor gofer write throughput makes that burst small.
-Production gVisor does not enforce Memory emptyDir sizeLimit as a tmpfs size,
-so containment relies on the watchdog, not ENOSPC. GnuCOBOL/gcc use the
-writable, executable `/tmp`. This package has no Java
-execution steps; the shared image also contains Java tools. Candidate stdout cannot forge a passing provider completion marker.
+The root filesystem is read-only in both chart paths and Compose. `/tmp` is a
+disk-backed emptyDir with a 512 MiB sizeLimit as an eviction backstop; the pod's
+ephemeral-storage budget is 1 GiB. Compose uses an anonymous disk-backed `/tmp`
+volume, without a portable disk quota. `/dev/shm` is mounted **read-only**
+(Memory emptyDir in Kubernetes; read-only, size=16m tmpfs in Docker).
+Writable memory-backed filesystem space is zero; anonymous memfds remain
+possible and are charged by the descriptor scan described below.
+
+Before issuing a receipt key or launching candidate code, `SETUP` starts a
+trusted short-lived probe through the same `restrict_child` path. It checks
+cross-UID descriptor `stat`, readable UID-65532 status with `VmRSS`, `/proc`
+enumeration, writable `oom_score_adj`, and writes and executes a tiny script
+on the `/tmp` work mount as UID 65532. A failure exits nonzero with fixed,
+sanitized text and becomes a withheld **harness error**, never `INCORRECT`.
+During later watchdog scans, an individual inaccessible or vanished entry is
+skipped; failure to enumerate `/proc` remains a supervisor error. Residual
+post-launch supervisor errors remain signed `INCORRECT` verdicts.
+
+The disk watchdog walks **all** of `/tmp`, `/var/tmp`, and `/dev/shm`, then scans
+`/proc/<pid>/fd` for every UID 65532 process. It sums regular-file
+`st_blocks * 512`, following only `/proc` descriptor magic links, and de-duplicates
+by `(st_dev, st_ino)` across the tree and all descriptors. The trusted root
+supervisor has `SYS_PTRACE` for Linux's cross-UID `PTRACE_MODE_READ` checks
+when following `/proc/<pid>/fd` magic links; the
+candidate sets `PR_SET_NO_NEW_PRIVS`, sets `PR_SET_KEEPCAPS=0`, and drops
+all three UIDs to 65532, clearing effective/permitted capabilities before exec.
+Both charts share this capability configuration in `values.yaml`; Compose and
+the Docker regression commands grant the same capabilities. Thus the 256 MiB budget
+covers directory-visible **plus descriptor-retained bytes**, including unlinked
+files and unmapped memfds. The walk also caps directory entries at 10,000.
+Either exceeded budget kills the candidate and signs `disk_exceeded=true`,
+scored `INCORRECT` with reason `disk limit exceeded`.
+
+The 2 GiB memory budget allows 768 MiB aggregate RSS + 256 MiB file/memfd bytes
++ allocation/write bursts during polling and scans + supervisor/runtime overhead
+(1024 MiB nominal headroom before bursts/overhead). RSS polls every 50 ms; disk
+scans repeat after 100 ms. These are sampling bounds, so bursts include scan
+latency as well as the polling interval. EmptyDir sizeLimit is an eviction
+backstop, not an enforced tmpfs quota under gVisor; the watchdog is the bound.
+Every directory/descriptor entry checks cancellation, and byte/inode exhaustion
+returns immediately. On candidate exit, the runner sets stop and joins each
+daemon watchdog for at most 0.2 s; a blocked scan cannot hold up signing.
+GnuCOBOL/gcc use writable, executable `/tmp`. This package has no Java execution
+steps; its shared image and supervisor environment set
+`JAVA_TOOL_OPTIONS=-XX:-UsePerfData` for Java tools. Candidate stdout cannot
+forge a passing provider completion marker.
 The output bound is **1 MiB** per captured stream/file and in aggregate across
 result files; reaching the bound fails. A missing or unverifiable authenticated
 receipt is a harness failure: Inspect records a sanitized sample error, and
@@ -238,10 +274,14 @@ use `us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox
 gVisor, spot nodes, one CPU, 2 GiB RAM, 1 GiB ephemeral storage, no service
 account token, and a release-scoped ingress/egress-deny NetworkPolicy.
 The custom chart creates only a Pod and NetworkPolicy, with no DNS sidecar.
-`anyeval_chart=False` explicitly selects the provider's built-in chart instead.
+`anyeval_chart=False` explicitly selects the provider's built-in chart instead;
+both charts consume the same `/tmp` and read-only `/dev/shm` volume definitions.
 
-The root supervisor needs only the template's SETUID, SETGID, KILL, CHOWN, and
-DAC_OVERRIDE capabilities; the candidate receives no effective capabilities.
+The root supervisor uses the template's SETUID, SETGID, KILL, CHOWN,
+DAC_OVERRIDE, and SYS_PTRACE capabilities; the candidate receives no effective
+or permitted capabilities. Docker and Kubernetes regressions require a signed
+nonzero exit and a `PermissionError` witness when the candidate attempts
+`os.stat("/proc/1/fd/0")`, proving it cannot use the supervisor's ptrace privilege.
 The namespace defaults to `anyeval-sandbox`. No runtime internet is required.
 AnyEval should resolve and pin the shared image digest when publishing.
 
@@ -288,7 +328,12 @@ The standalone real Linux regressions exercise the actual production
 `SETUP` + `RUNNER` and shared receipt verification/failure gate with
 synthetic candidates: invalid stdout byte `0xff` with exit 1, detached children
 forked until failure, unbounded memory allocation, three children each allocating
-600 MiB, and unbounded 1 MiB files that must trip the disk watchdog. Every failure case must produce
+600 MiB, and unbounded 1 MiB files. Additional disk attacks retain 300 unlinked
+one-MiB files across four workers, retain 300 MiB in memfds across four workers,
+and attempt 50,000 empty files. All must trip `disk_exceeded` and sign within
+the 30-second exec deadline. A `/dev/shm` write must fail with no watchdog flags. The ptrace probe must
+receive `PermissionError` for `/proc/1/fd/0`, emit its witness, and exit 1.
+Every failure case must produce
 an authenticated `INCORRECT` outcome; logs contain only stage, returncode and
 boolean flags. Run them in the reference image through Cloud Build:
 
@@ -300,7 +345,7 @@ The Docker builder runs the script as root in the reference image with its
 Docker CLI copied into `/workspace` and passed via `--docker-cli`, with the
 socket available. The memory and disk cases run in a separate
 `docker run --memory=2g --memory-swap=2g --pids-limit=128 --read-only
---volume /tmp --shm-size=16m` container.
+--volume /tmp --tmpfs /dev/shm:ro,size=16m --cap-add=SYS_PTRACE` container.
 For an already running disposable reference container without Docker, use
 `python3 scripts/linux_regressions.py`: the memory case instead runs the actual
 supervisor under `prlimit` with a 1 GiB AS/DATA budget. That fallback verifies
@@ -321,7 +366,8 @@ Kubernetes chart and values as the package tasks (including gVisor and deny-all
 egress), with a mock model and synthetic Python candidates only. It checks
 `0xff` output, fork exhaustion, three 600 MiB children (requiring the signed
 `memory_exceeded` flag), unbounded disk writes (requiring signed
-`disk_exceeded=true` and a nonzero exit), and
+`disk_exceeded=true` and a nonzero exit), the same unlinked-file, memfd,
+50,000-entry and read-only `/dev/shm` cases, and
 exit 0 with a detached sleeping child (requiring a successful receipt and
 cleanup). The disk writer creates a work-directory file and fills a second
 directory directly under `/tmp`, proving coverage beyond the work directory.

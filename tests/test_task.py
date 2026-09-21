@@ -19,9 +19,12 @@ def test_docker_task_builds_offline():
     service = config["services"]["default"]
     assert service["image"] == "eval-cobol-sandbox:local"
     assert service["build"]["dockerfile"] == "Dockerfile"
-    assert set(service["cap_add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
+    assert set(service["cap_add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"}
     assert service["network_mode"] == "none"
     assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["volumes"] == ["/tmp"]
+    assert service["tmpfs"] == ["/dev/shm:ro,size=16m"]
     assert not task.dataset[0].target
 
 
@@ -162,7 +165,7 @@ def test_render_default_chart_matches_anyeval_pod_contract(helm):
     values = yaml.safe_load(config.values.read_text())
     assert security == values["services"]["default"]["securityContext"]
     assert security["runAsUser"] == security["runAsGroup"] == 0
-    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
+    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"}
     assert not security.get("privileged", False)
     assert security["seccompProfile"] == {"type": "RuntimeDefault"}
     assert security["runAsNonRoot"] is False
@@ -173,7 +176,7 @@ def test_render_default_chart_matches_anyeval_pod_contract(helm):
         {'name': 'shm', 'emptyDir': {'medium': 'Memory', 'sizeLimit': '16Mi'}},
     ]
     assert container['volumeMounts'] == [
-        {'name': 'tmp', 'mountPath': '/tmp'}, {'name': 'shm', 'mountPath': '/dev/shm'},
+        {'name': 'tmp', 'mountPath': '/tmp'}, {'name': 'shm', 'mountPath': '/dev/shm', 'readOnly': True},
     ]
     assert security["capabilities"]["drop"] == ["ALL"]
     policy = next(r for r in resources if r and r["kind"] == "NetworkPolicy")
@@ -243,3 +246,26 @@ def test_generation_defaults_match_upstream_chat_api():
     task = cobolcodebench(sandbox_type='docker')
     assert task.config.temperature == 0.3
     assert task.config.max_tokens == 4096
+
+
+def test_provider_chart_renders_identical_sandbox_storage(helm):
+    provider = pytest.importorskip('k8s_sandbox')
+    chart = Path(provider.__file__).parent / 'resources/helm/agent-env'
+    values_path = cobolcodebench(anyeval_chart=False).sandbox.config
+    result = subprocess.run([helm, 'template', 'ccb-provider', str(chart),
+                             '-n', 'anyeval-sandbox', '-f', str(values_path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    resources = [r for r in yaml.safe_load_all(result.stdout) if r]
+    workload = next(r for r in resources if r['kind'] == 'StatefulSet')
+    spec = workload['spec']['template']['spec']
+    service = yaml.safe_load(Path(values_path).read_text())['services']['default']
+    container = next(c for c in spec['containers'] if c['name'] == 'default')
+    assert container['securityContext'] == service['securityContext']
+    assert set(container['securityContext']['capabilities']['add']) == {
+        'SETUID', 'SETGID', 'KILL', 'CHOWN', 'DAC_OVERRIDE', 'SYS_PTRACE'}
+    assert container['securityContext']['capabilities']['drop'] == ['ALL']
+    assert container['securityContext']['readOnlyRootFilesystem'] is True
+    assert [m for m in container['volumeMounts'] if m['mountPath'] in {'/tmp', '/dev/shm'}] == service['volumeMounts']
+    for volume in service['volumes']:
+        assert volume in spec['volumes']
