@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -58,21 +59,67 @@ def test_checksum_failure_is_private(monkeypatch):
         load_records()
 
 
+def assert_reference_eligibility(info):
+    assert set(info) == {'schema_version', 'checked_at', 'reference_image',
+                         'source_sha256', 'method', 'evidence',
+                         'eligible_task_ids', 'excluded_tasks'}
+    checked_at = datetime.fromisoformat(info['checked_at'])
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    assert checked_at <= datetime.now(timezone.utc)
+    assert info['schema_version'] == 1
+    assert info['source_sha256'] == manifest()['source_sha256']
+    assert info['excluded_tasks'] == {
+        'task_func_17': {'reason': 'compile error (exit 1)', 'stage': 'compile', 'returncode': 1},
+        **{f'task_func_{n}': {'reason': 'run error (exit 1)', 'stage': 'run', 'returncode': 1}
+           for n in (20, 55)},
+        **{f'task_func_{n}': {'reason': 'output mismatch', 'stage': 'compare'}
+           for n in (21, 23, 47, 48, 49)},
+    }
+    assert info['eligible_task_ids'] == [
+        name for name in manifest()['task_ids'] if name not in info['excluded_tasks']
+    ]
+    assert len(info['eligible_task_ids']) == 38
+
+
 def test_reference_eligibility_partition_and_reasons():
     from cobolcodebench.dataset import eligibility, load_eligible_records
     from cobolcodebench.task import load_dataset
     info = eligibility()
-    assert info['checked_at'] == '2026-09-20'
-    assert set(info['excluded_tasks']) == {f'task_func_{n:02}' for n in (17,20,21,23,47,48,49,55)}
-    assert info['excluded_tasks']['task_func_17']['reason'] == 'compile error'
-    for n in (20, 55):
-        assert info['excluded_tasks'][f'task_func_{n}']['reason'] == 'run error (exit 1)'
-    for n in (21,23,47,48,49):
-        assert info['excluded_tasks'][f'task_func_{n}']['reason'].startswith('output mismatch')
-    assert 'also an input' in info['excluded_tasks']['task_func_49']['reason']
+    assert_reference_eligibility(info)
     assert len(info['eligible_task_ids']) == len(load_eligible_records()) == 38
     for mode in ('instruct', 'complete'):
         assert [sample.id for sample in load_dataset(mode)] == info['eligible_task_ids']
+
+
+@pytest.mark.parametrize('checked_at', ['2000-01-01', datetime.now(timezone.utc).isoformat()])
+def test_generated_reference_eligibility_passes_same_validation(checked_at):
+    from cobolcodebench.dataset import eligibility
+    from scripts import canonical_check as checker
+
+    outcomes = {
+        name: ({'reason': f'{stage} error (exit 1)', 'stage': stage, 'returncode': 1}
+               if stage in ('compile', 'run') else {'reason': 'output mismatch', 'stage': stage})
+        for name, stage in {
+            'task_func_17': 'compile', 'task_func_20': 'run',
+            'task_func_21': 'compare', 'task_func_23': 'compare',
+            'task_func_47': 'compare', 'task_func_48': 'compare',
+            'task_func_49': 'compare', 'task_func_55': 'run',
+        }.items()
+    }
+    report = checker.make_eligibility(
+        load_records(), manifest()['source_sha256'], checker.IMAGE,
+        checked_at, 'authored test', check=lambda record: outcomes.get(record['program_name']))
+    assert_reference_eligibility(report)
+    expected = {**eligibility(), 'checked_at': checked_at, 'evidence': 'authored test'}
+    assert json.dumps(report, indent=2) == json.dumps(expected, indent=2)
+
+
+@pytest.mark.parametrize('checked_at', ['invalid', '9999-12-31', '9999-12-31T00:00:00+00:00'])
+def test_reference_eligibility_validation_rejects_invalid_or_future_dates(checked_at):
+    from cobolcodebench.dataset import eligibility
+    with pytest.raises((ValueError, AssertionError)):
+        assert_reference_eligibility({**eligibility(), 'checked_at': checked_at})
 
 
 def test_eligibility_rejects_an_incomplete_partition(monkeypatch):

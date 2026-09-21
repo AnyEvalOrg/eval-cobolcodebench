@@ -31,8 +31,12 @@ eight canonical failures are dataset defects and are excluded from both tasks:
 | `task_func_23` | Output mismatch |
 | `task_func_47` | Output mismatch |
 | `task_func_48` | Output mismatch |
-| `task_func_49` | Output mismatch; output file is also an input file |
+| `task_func_49` | Output mismatch |
 | `task_func_55` | Run error, exit 1 |
+
+`task_func_49` has no input files. Its canonical solution uses `FUNCTION RANDOM`
+without an explicit seed to generate records, which are compared against a fixed
+expected file; the record alone does not establish the exact differing bytes.
 
 `cobolcodebench/data/eligibility.json` records this operator-provided result,
 reasons, image, source hash, and the ordered eligible IDs. All 46 original
