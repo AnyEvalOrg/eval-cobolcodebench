@@ -144,22 +144,24 @@ protected root supervisor memory, authenticated receipts, independent UID
 sweeps, process/file-size limits, and cleanup on cancellation or provider
 failure. Candidate stdout cannot forge a passing provider completion marker.
 The output bound is **1 MiB** per captured stream/file and in aggregate across
-result files; reaching the bound fails. Missing authenticated receipts fail
-closed. A cleanup failure aborts scoring as a sanitized infrastructure error.
+result files; reaching the bound fails. A missing or unverifiable authenticated
+receipt is a harness failure: Inspect records a sanitized sample error, and
+AnyEval refuses to publish the run. It does not enter the published pass rate.
+A cleanup failure aborts scoring as a sanitized infrastructure error.
 
 ## Scores and publication
 
 AnyEval returns `CORRECT` **only when compilation and execution succeed and
 every output file exists and matches its expected UTF-8 bytes exactly**.
 Whitespace, line endings, and trailing newlines are significant. Missing files,
-compile/runtime errors, timeouts, unsafe files, and output overflow are
-`INCORRECT`. Candidate stdout is not an answer channel. Authenticated receipt file values
-are base64-decoded exactly once before comparison; encoded strings are rejected
+compile/runtime errors, timeouts, unsafe files, and output overflow reported
+in authenticated receipts are `INCORRECT`. Candidate stdout is not an answer
+channel. Authenticated receipt file values are base64-decoded exactly once
+before comparison; encoded strings are rejected
 at the comparison boundary. No whitespace or newline normalization is applied
 to the exact verdict.
 
-The JSON explanation always records `compile_success` (true/false, or null
-when no authenticated compile status is available), a numeric
+The JSON explanation always records `compile_success` (true/false), a numeric
 `upstream_score`, and a short result reason. No file contents or compiler
 diagnostics appear in explanations.
 

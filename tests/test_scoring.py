@@ -11,6 +11,18 @@ from inspect_ai.util import ExecResult, OutputLimitExceededError
 import cobolcodebench.scoring as scoring
 
 
+WITHHELD = "Private sandbox operation failed; details withheld."
+
+
+def assert_sample_error(kind="complete"):
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(scoring.file_scorer(kind)(state(kind), Target("")))
+    assert str(raised.value) == WITHHELD
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.__suppress_context__ is True
+
+
 def record(expected='2', test_input='PRIVATE_INPUT'):
     return dict(program_name='task_func_01', input_file_names='input.txt',
                 output_file_names='one.txt, two.txt', inputs=json.dumps({'input.txt': test_input}),
@@ -78,20 +90,20 @@ def synthetic_records(monkeypatch):
 
 
 @pytest.mark.parametrize('kind', ['instruct', 'complete'])
-@pytest.mark.parametrize('outcome', ['correct', 'runtime', 'compile', 'compile_timeout', 'timeout', 'overflow', 'missing_receipt', 'missing_file', 'wrong_second'])
+@pytest.mark.parametrize('outcome', ['correct', 'runtime', 'compile', 'compile_timeout', 'timeout', 'overflow', 'incomplete', 'missing_file', 'wrong_second'])
 def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome):
-    fields = dict(stage='compile' if outcome in {'compile','compile_timeout'} else 'run',
+    fields = dict(stage='compile' if outcome in {'compile','compile_timeout','incomplete'} else 'run',
                   returncode=1 if outcome in {'runtime','compile'} else 0,
                   timeout=outcome in {'timeout','compile_timeout'}, overflow=outcome == 'overflow')
     outputs = {'one.txt':'2', 'two.txt': '9' if outcome == 'wrong_second' else None if outcome == 'missing_file' else '2'}
-    response = '' if outcome == 'missing_receipt' else signed_receipt(bytes(range(32)), '/tmp/ccb-fresh_1', outputs=outputs, **fields)
+    response = signed_receipt(bytes(range(32)), '/tmp/ccb-fresh_1', outputs=outputs, **fields)
     fake = FakeSandbox([response])
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.file_scorer(kind)(state(kind), Target('')))
     assert score.value == (CORRECT if outcome == 'correct' else INCORRECT)
     explanation = json.loads(score.explanation)
     assert isinstance(explanation['upstream_score'], (float,int))
-    assert explanation['compile_success'] == (None if outcome == 'missing_receipt' else outcome not in {'compile','compile_timeout'})
+    assert explanation['compile_success'] == (outcome not in {'compile','compile_timeout','incomplete'})
     assert len(fake.calls) == 4
     assert fake.calls[1][0][:4] == ['timeout','-s','KILL','100s']
     assert fake.calls[1][1]['timeout_retry'] is False
@@ -132,35 +144,34 @@ def test_bad_mode_rejected(mode):
         scoring.file_scorer(mode+'-bad')
 
 
-def test_lost_supervisor_response_is_incorrect(monkeypatch):
-    fake = FakeSandbox([ConnectionError("cluster unavailable")])
+@pytest.mark.parametrize("failure", [ConnectionError("private provider exception"),
+                                     TimeoutError("private timeout output")])
+def test_lost_supervisor_response_is_sample_error(monkeypatch, failure):
+    fake = FakeSandbox([failure])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.file_scorer("complete")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert json.loads(score.explanation)["reason"] == "supervisor did not complete"
+    assert_sample_error()
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 @pytest.mark.parametrize("kind", ["complete", "instruct"])
-def test_output_limit_is_incorrect(monkeypatch, kind):
+def test_output_limit_is_sample_error(monkeypatch, kind):
     fake = FakeSandbox([OutputLimitExceededError("fixture limit", None)])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.file_scorer(kind)(state(kind), Target("")))
-    assert score.value == INCORRECT
-    assert "supervisor did not complete" in score.explanation
+    assert_sample_error(kind)
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 @pytest.mark.parametrize("forgery", [
+    "",
     "2<completed-sentinel-value-0>",
     signed_receipt(b"wrong key", "/tmp/ccb-fresh_1"),
     '{"returncode":0,"output":"2"}',
 ])
-def test_forged_completion_marker_or_receipt_is_incorrect(monkeypatch, forgery):
+def test_missing_or_forged_receipt_is_sample_error(monkeypatch, forgery):
     fake = FakeSandbox([forgery])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.file_scorer("complete")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert "supervisor did not complete" in score.explanation
+    assert_sample_error()
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 def test_marker_inside_captured_candidate_output_cannot_hide_failure(monkeypatch):
@@ -187,7 +198,7 @@ def test_authenticated_failure_channels(monkeypatch, field, value):
     assert score.value == INCORRECT
 
 
-def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
+def test_setup_timeout_is_bounded_and_sample_error(monkeypatch):
     class HungSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
             if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND):
@@ -195,10 +206,10 @@ def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
             assert cmd[:4] == ["timeout", "-s", "KILL", "5s"]
             assert kwargs["timeout"] == 5
             raise TimeoutError("private material")
-    install_sandbox(monkeypatch, HungSetup([]))
-    score = asyncio.run(scoring.file_scorer("complete")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert "private material" not in score.explanation
+    fake = HungSetup([])
+    install_sandbox(monkeypatch, fake)
+    assert_sample_error()
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 @pytest.mark.parametrize('response', [result(), result('3'), result(returncode=7), '',
@@ -207,7 +218,10 @@ def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
 def test_uid_cleanup_is_a_separate_exec_on_every_run_outcome(monkeypatch, response):
     fake = FakeSandbox([response, response])
     install_sandbox(monkeypatch, fake)
-    asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
+    if isinstance(response, Exception) or response == '':
+        assert_sample_error()
+    else:
+        asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
     runs = [i for i, (cmd, _) in enumerate(fake.calls) if scoring.RUNNER in cmd]
     assert runs
     for index in runs:
@@ -235,9 +249,7 @@ def test_missing_receipt_waits_through_host_deadline_before_uid_sweep(monkeypatc
     monkeypatch.setattr(scoring.asyncio, 'sleep', wait)
     fake = MissingSupervisor([''])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
-    assert score.value == INCORRECT
-    assert json.loads(score.explanation)["reason"] == "supervisor did not complete"
+    assert_sample_error()
     assert events == ['deadline', 'sweep']
 
 
@@ -274,7 +286,8 @@ def test_scorer_cancellation_still_awaits_independent_uid_sweep(monkeypatch):
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
-@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError()])
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(),
+                                     OutputLimitExceededError('private output', None)])
 def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
     class FailedSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
@@ -284,11 +297,7 @@ def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
 
     fake = FailedSetup([])
     install_sandbox(monkeypatch, fake)
-    if isinstance(failure, TimeoutError):
-        assert asyncio.run(scoring.file_scorer("complete")(state(), Target(''))).value == INCORRECT
-    else:
-        with pytest.raises(RuntimeError, match='details withheld'):
-            asyncio.run(scoring.file_scorer("complete")(state(), Target('')))
+    assert_sample_error()
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
@@ -307,10 +316,66 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
-def test_receipt_for_another_directory_is_incorrect(monkeypatch):
+def test_receipt_for_another_directory_is_sample_error(monkeypatch):
     fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/ccb-other')])
     install_sandbox(monkeypatch, fake)
-    assert asyncio.run(scoring.file_scorer('complete')(state(), Target(''))).value == INCORRECT
+    assert_sample_error()
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('phase', ['setup', 'runner'])
+def test_exec_never_returns_is_bounded_and_sample_error(monkeypatch, phase):
+    class HungExec(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if (scoring.SETUP if phase == 'setup' else scoring.RUNNER) in cmd:
+                self.calls.append((cmd, kwargs))
+                await asyncio.Event().wait()
+            return await super().exec(cmd, **kwargs)
+
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(scoring.asyncio, 'timeout', lambda delay: real_timeout(0.01))
+    fake = HungExec([])
+    install_sandbox(monkeypatch, fake)
+    assert_sample_error()
+    assert [cmd for cmd, _ in fake.calls[-2:]] == [
+        scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND,
+    ]
+
+
+@pytest.mark.parametrize('response', [
+    '',
+    '{"returncode":0,"output":"PRIVATE_STDOUT"}',
+    signed_receipt(b'wrong key', '/tmp/ccb-fresh_1'),
+    signed_receipt(bytes(range(32)), '/tmp/ccb-fresh_1').replace('run', 'compile'),
+    signed_receipt(bytes(range(32)), '/tmp/ccb-other'),
+    TimeoutError('PRIVATE_EXCEPTION PRIVATE_STDIN PRIVATE_STDERR PRIVATE_CODE'),
+    OutputLimitExceededError('PRIVATE_STDOUT PRIVATE_STDERR', None),
+    ConnectionError('PRIVATE_EXCEPTION PRIVATE_STDIN PRIVATE_CODE'),
+], ids=['missing', 'unsigned', 'bad-signature', 'tampered', 'wrong-cwd',
+        'exec-timeout', 'output-limit', 'provider-error'])
+def test_rejected_receipt_records_inspect_sample_error(monkeypatch, tmp_path, response):
+    from inspect_ai import Task, eval
+    from inspect_ai.dataset import Sample
+    from inspect_ai._util import appdirs
+
+    monkeypatch.setattr(appdirs, 'user_data_path', lambda package: tmp_path / 'data')
+    monkeypatch.setattr(appdirs, 'user_cache_path', lambda package: tmp_path / 'cache')
+    fake = FakeSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    task = Task(dataset=[Sample(id='task_func_01', input='Synthetic task')],
+                solver=[], scorer=scoring.file_scorer('complete'))
+    [log] = eval(task, model='mockllm/model', log_dir=str(tmp_path),
+                 display='none', fail_on_error=False, retry_on_error=0,
+                 log_realtime=False, ctl_server=False)
+    [sample] = log.samples
+    assert sample.error is not None
+    assert sample.error.message == repr(RuntimeError(WITHHELD))
+    assert not sample.scores
+    rendered = sample.error.model_dump_json()
+    for secret in ('PRIVATE_EXCEPTION', 'PRIVATE_STDIN', 'PRIVATE_STDOUT',
+                   'PRIVATE_STDERR', 'PRIVATE_CODE', 'PRIVATE_INPUT', 'PRIVATE_CANONICAL'):
+        assert secret not in rendered
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 @pytest.mark.parametrize('sample_id', ['task_func_02', 'task_func_05'])
