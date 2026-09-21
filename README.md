@@ -141,22 +141,36 @@ For each sample the sandbox supervisor:
 
 The shared reviewed supervisor uses credential drops, no-new-privileges,
 protected root supervisor memory, authenticated receipts, independent UID
-sweeps, process/file-size limits, and cleanup on cancellation or provider
-failure. Candidate stdout cannot forge a passing provider completion marker.
+sweeps, process/memory/file-size limits, and cleanup on cancellation or provider
+failure. Both `cobc` and generated executables have hard `RLIMIT_NPROC=64`
+(below the runtime's 128 PID limit), `RLIMIT_AS=RLIMIT_DATA=1 GiB`, and
+`RLIMIT_CORE=0`. Before dropping privileges, the supervisor sets the child's
+`oom_score_adj=1000`, inherited by descendants. The pod requests and limits
+are both 2 GiB, leaving headroom for the supervisor. This package has no Java
+execution steps; the shared image also contains Java tools. Candidate stdout cannot forge a passing provider completion marker.
 The output bound is **1 MiB** per captured stream/file and in aggregate across
 result files; reaching the bound fails. A missing or unverifiable authenticated
 receipt is a harness failure: Inspect records a sanitized sample error, and
 AnyEval refuses to publish the run. It does not enter the published pass rate.
-A cleanup failure aborts scoring as a sanitized infrastructure error.
+The supervisor kills process groups and sweeps `/proc` using `os.kill`, without
+spawning cleanup processes. Post-run exceptions produce signed failure flags.
+A signed cleanup failure scores `INCORRECT`; the scorer still performs its
+independent UID cleanup. Failure of that independent infrastructure cleanup
+aborts scoring, preventing unsafe sandbox reuse.
 
 ## Scores and publication
 
 AnyEval returns `CORRECT` **only when compilation and execution succeed and
 every output file exists and matches its expected UTF-8 bytes exactly**.
 Whitespace, line endings, and trailing newlines are significant. Missing files,
-compile/runtime errors, timeouts, unsafe files, and output overflow reported
+compile/runtime errors, timeouts, unsafe files, invalid UTF-8, and output overflow reported
 in authenticated receipts are `INCORRECT`. Candidate stdout is not an answer
-channel. Authenticated receipt file values are base64-decoded exactly once
+channel. Raw stdout and file bytes are base64-encoded before signing. The scorer
+authenticates the envelope and strictly validates supervisor status fields first.
+Malformed output fields or undecodable text then score `INCORRECT` with reason
+`output not decodable`; they never become a missing receipt. Bad signatures or
+corrupt supervisor status fields remain harness errors.
+Authenticated receipt file values are base64-decoded exactly once
 before comparison; encoded strings are rejected
 at the comparison boundary. No whitespace or newline normalization is applied
 to the exact verdict.
@@ -245,6 +259,28 @@ opt-in real Linux containment tests require root in a disposable container,
 an unused UID 65532, and `CCB_LINUX_CONTAINMENT=1`. Docker/Kubernetes end-to-end
 compilation and these containment checks must be run on a suitable runtime;
 the package does not execute dataset or model programs on the developer host.
+
+The standalone real Linux regressions exercise the actual production
+`SETUP` + `RUNNER` and shared receipt verification/failure gate with three
+synthetic candidates: invalid stdout byte `0xff` with exit 1, detached children
+forked until failure, and unbounded memory allocation. Every case must produce
+an authenticated `INCORRECT` outcome; logs contain only stage, returncode and
+boolean flags. Run them in the reference image through Cloud Build:
+
+```sh
+gcloud builds submit . --config scripts/cloudbuild-linux-regressions.yaml
+```
+
+The Docker builder runs the script as root in the reference image with its
+Docker CLI and socket available. The memory case runs in a separate
+`docker run --memory=512m --memory-swap=512m --pids-limit=128` container.
+For an already running disposable reference container without Docker, use
+`python3 scripts/linux_regressions.py`: the memory case instead runs the actual
+supervisor under `prlimit` with a 1 GiB AS/DATA budget. That fallback verifies
+address-space exhaustion, not cgroup OOM survival. A present but unavailable
+Docker daemon fails the regression instead of silently using the fallback.
+These Linux checks require no Inspect installation in the image and are
+operator-run; the macOS unit suite does not claim to execute them.
 
 `anyeval.json` declares `sandbox-k8s` and 38 samples per task. Publishing into
 AnyEval additionally requires the application's distribution pin, catalog/task

@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import re
 
@@ -18,6 +15,7 @@ from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, RUNNER, SETUP
 from .execution import execution_request
 from .code_extractor import assemble_program
 from .comparison import compare_outputs
+from .receipts import verify_receipt, receipt_failure
 
 
 def verdict(reason: str, compile_success: bool | None = None,
@@ -104,14 +102,9 @@ def file_scorer(mode: str):
         if receipt is None:
             raise RuntimeError("Private sandbox operation failed; details withheld.") from None
         compiled = receipt['compile_success']
-        if receipt['timeout']:
-            return verdict(f"{receipt['stage']} timeout", compiled)
-        if receipt['overflow']:
-            return verdict('output limit exceeded', compiled)
-        if receipt['returncode'] != 0:
-            return verdict(f"{receipt['stage']} error (exit {receipt['returncode']})", compiled)
-        if receipt['stage'] != 'run' or not compiled:
-            return verdict('run did not complete', compiled)
+        failure = receipt_failure(receipt)
+        if failure is not None:
+            return verdict(failure, compiled)
         expected = json.loads(record['outputs'])
         correct, diagnostic, count = compare_outputs(receipt['outputs'], expected)
         return verdict(f'{count}/{len(expected)} output files match exactly', compiled,
@@ -150,32 +143,3 @@ async def cleanup_candidate(environment, not_before: float = 0) -> None:
     except Exception:
         # In particular do not turn a cleanup timeout into a candidate verdict.
         raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None
-
-
-def verify_receipt(stdout: str, key: bytes) -> dict | None:
-    """Authenticate exact wrapper bytes before interpreting status or output."""
-    try:
-        envelope = json.loads(stdout)
-        body, tag = envelope["body"], envelope["tag"]
-        if not hmac.compare_digest(hmac.new(key, body.encode(), hashlib.sha256).hexdigest(), tag):
-            return None
-        receipt = json.loads(body)
-        if (type(receipt["returncode"]) is not int
-                or type(receipt["timeout"]) is not bool
-                or type(receipt["overflow"]) is not bool
-                or receipt.get("stage") not in {"compile", "run"}
-                or not re.fullmatch(r"/tmp/ccb-[a-zA-Z0-9_-]+", receipt["cwd"])):
-            return None
-        if type(receipt['compile_success']) is not bool or not isinstance(receipt['outputs'], dict):
-            return None
-        if receipt['stage'] == 'run' and not receipt['compile_success']:
-            return None
-        receipt['outputs'] = {
-            name: None if value is None else base64.b64decode(value, validate=True)
-            for name, value in receipt['outputs'].items()
-        }
-        # stdout is private and irrelevant to the verdict; retained for runner tests.
-        receipt['output'] = base64.b64decode(receipt['output'], validate=True).decode('utf-8', errors='replace')
-        return receipt
-    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
-        return None

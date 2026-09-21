@@ -405,3 +405,70 @@ def test_actual_runner_base64_receipt_scores_correct(monkeypatch, sample_id, mod
     assert score.value == CORRECT
     assert json.loads(score.explanation) == dict(compile_success=True, upstream_score=1.0,
                                                 reason=f'{len(expected)}/{len(expected)} output files match exactly')
+
+
+def resign_receipt(**changes):
+    key = bytes(range(32))
+    body = json.loads(json.loads(signed_receipt(key, '/tmp/ccb-fresh_1'))['body'])
+    body.update(changes)
+    body = json.dumps(body)
+    return json.dumps({'body': body, 'tag': hmac.new(key, body.encode(), hashlib.sha256).hexdigest()})
+
+
+@pytest.mark.parametrize('fields', [
+    {'output': '/w=='}, {'outputs': {'one.txt': '/w=='}},
+    {'output': 'not base64'}, {'outputs': []}, {'outputs': {'one.txt': 42}},
+    {'outputs': {'one.txt': 'not base64'}}, {'output': None},
+])
+def test_authenticated_invalid_output_is_incorrect(monkeypatch, fields):
+    envelope = resign_receipt(**fields)
+    receipt = scoring.verify_receipt(envelope, bytes(range(32)))
+    assert receipt is not None and receipt['output_not_decodable']
+    fake = FakeSandbox([envelope])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert json.loads(score.explanation)['reason'] == 'output not decodable'
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('fields', [
+    {'returncode': True}, {'timeout': 1}, {'overflow': None}, {'stage': []},
+    {'cwd': '../candidate'}, {'compile_success': 1}, {'cleanup_failed': 'yes'},
+    {'supervisor_error': 1}, {'stage': 'run', 'compile_success': False},
+])
+def test_invalid_supervisor_fields_reject_envelope(fields):
+    assert scoring.verify_receipt(resign_receipt(**fields), bytes(range(32))) is None
+
+
+def test_bad_signature_rejected_before_output_decode():
+    envelope = json.loads(resign_receipt(output='/w==', outputs=[]))
+    envelope['tag'] = '0' * 64
+    assert scoring.verify_receipt(json.dumps(envelope), bytes(range(32))) is None
+
+
+@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
+def test_signed_supervision_failure_is_incorrect_with_independent_cleanup(monkeypatch, flag):
+    fake = FakeSandbox([resign_receipt(**{flag: True})])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('code', ["import os; os.write(1, b'\\xff'); raise SystemExit(1)",
+                                  "open('one.txt', 'wb').write(b'\\xff')"])
+def test_actual_runner_invalid_utf8_scores_incorrect(monkeypatch, code):
+    from test_sandbox_runner import run_fixture
+    envelope, setup = run_fixture(run_code=code, output_file='one.txt', raw_receipt=True)
+
+    class RealReceiptSandbox(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd[-1] == scoring.SETUP:
+                return result(json.dumps(setup))
+            return await super().exec(cmd, **kwargs)
+
+    install_sandbox(monkeypatch, RealReceiptSandbox([envelope]))
+    score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert 'output not decodable' in score.explanation

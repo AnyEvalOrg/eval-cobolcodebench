@@ -28,6 +28,11 @@ services:
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
+    # Equal CPU/memory requests and limits give Guaranteed QoS. Each candidate
+    # cobc/executable has 1 GiB AS/DATA hard limits; 2 GiB leaves headroom for
+    # the root supervisor, compiler children, capture buffers and pod overhead.
+    # Candidate NPROC=64 stays below the runtime's 128 PID budget; candidates
+    # inherit oom_score_adj=1000 so an overshoot preferentially kills them.
     resources:
       requests:
         cpu: "1"
