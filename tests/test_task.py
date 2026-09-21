@@ -11,7 +11,7 @@ from cobolcodebench import cobolcodebench_instruct as cobolcodebench
 
 def test_docker_task_builds_offline():
     task = cobolcodebench(sandbox_type="docker")
-    assert len(task.dataset) == 46
+    assert len(task.dataset) == 38
     assert task.epochs == 1
     assert task.sandbox.type == "docker"
     assert Path(task.sandbox.config).is_file()
@@ -222,12 +222,12 @@ def test_reverse_task_and_anyeval_catalog_match():
     import json
     from cobolcodebench import cobolcodebench_complete
     task = cobolcodebench_complete(sandbox_type='docker')
-    assert len(task.dataset) == 46 and task.epochs == 1
+    assert len(task.dataset) == 38 and task.epochs == 1
     assert task.metadata['metric'] == 'pass@1'
     catalog = json.loads(Path('anyeval.json').read_text())
     assert catalog['execution']['class'] == 'sandbox-k8s'
-    assert catalog['tasks'] == [{'name': 'cobolcodebench_instruct', 'samples': 46}, {'name': 'cobolcodebench_complete', 'samples': 46}]
-    assert catalog['total_samples'] == 92
+    assert catalog['tasks'] == [{'name': 'cobolcodebench_instruct', 'samples': 38}, {'name': 'cobolcodebench_complete', 'samples': 38}]
+    assert catalog['total_samples'] == 76
     assert catalog['upstream']['commit'] == '9d02534b7d1aabcbac1a1ec21c5a5e80c50323a8'
 
 

@@ -186,6 +186,9 @@ try:
         with open(path, "x", encoding="utf-8") as f:
             f.write(content)
         os.chmod(path, 0o644)
+        # COBOL OPEN I-O / EXTEND and REWRITE need owner write access, including
+        # when a declared output is also an input. The launch dir stays root-owned.
+        os.chown(path, CANDIDATE_UID, CANDIDATE_GID)
     status, output = run_step(request["argv"], request["timeout"], candidate_work)
     stage = "compile"
     compile_success = status["returncode"] == 0 and not status["timeout"] and not status["overflow"]

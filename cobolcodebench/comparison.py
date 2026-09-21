@@ -23,6 +23,8 @@ def compare_outputs(actual: dict[str, bytes | None], expected: dict[str, str]) -
         if content is None:
             missing = True
             continue
+        if not isinstance(content, bytes):
+            raise TypeError('Output comparison requires decoded file bytes')
         exact = content == text.encode('utf-8')
         exact_count += int(exact)
         try:

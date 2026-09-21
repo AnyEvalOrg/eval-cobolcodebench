@@ -20,7 +20,7 @@ def prepare(request):
 
 
 def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_file=None,
-                real_supervisor=False):
+                real_supervisor=False, raw_receipt=False):
     request = dict(files={'fixture.txt': 'safe authored input'}, argv=[sys.executable, '-I', '-c', compile_code],
                    run_argv=[sys.executable, '-I', '-c', run_code], timeout=timeout, run_timeout=timeout, output_limit=4096)
     if output_file:
@@ -36,6 +36,12 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         source = source.replace('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)', 'pass')
         source = source.replace('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)', 'pass')
         source = source.replace('os.chown(candidate_work, CANDIDATE_UID, CANDIDATE_GID)', 'pass')
+        # Assert ownership is requested for every staged file, before compilation.
+        source = source.replace('os.chown(path, CANDIDATE_UID, CANDIDATE_GID)',
+                                'assert os.stat(path).st_mode & 0o777 == 0o644; staged_owners[path] = (CANDIDATE_UID, CANDIDATE_GID)')
+        source = source.replace('limit = request["output_limit"]', 'limit = request["output_limit"]; staged_owners = {}')
+        source = source.replace('status, output = run_step(request["argv"],',
+                                'assert staged_owners == {os.path.join(candidate_work, name): (65532, 65532) for name in request["files"]}; status, output = run_step(request["argv"],')
         source = source.replace('info.st_uid != CANDIDATE_UID', 'info.st_uid != os.getuid()')
         source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
         start, end = source.index('def sweep_uid():'), source.index('def run_step(')
@@ -47,6 +53,8 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt is not None
         assert not Path(setup['cwd']).exists()
+        if raw_receipt:
+            return result.stdout, setup
         return receipt
     finally:
         shutil.rmtree(setup['cwd'], ignore_errors=True)
@@ -152,6 +160,22 @@ def test_each_stage_has_independent_timeout(stage):
 def test_output_file_receipt():
     receipt = run_fixture(run_code="open('OUT.TXT','w').write('p23\\n')", output_file='OUT.TXT')
     assert receipt['outputs'] == {'OUT.TXT': b'p23\n'} and receipt['returncode'] == 0
+
+
+def test_staged_input_is_writable_in_place_and_can_be_an_output(output_limit_runner):
+    receipt = output_limit_runner(run_code='''import os
+assert os.stat('fixture.txt').st_uid == os.getuid()
+if os.getuid() == 65532:
+    assert os.stat('fixture.txt').st_gid == 65532
+assert os.stat('fixture.txt').st_mode & 0o777 == 0o644
+assert os.stat('..').st_uid == (0 if os.getuid() == 65532 else os.getuid())
+with open('fixture.txt', 'r+') as f:
+    f.write('UPDATED')
+with open('fixture.txt', 'a') as f:
+    f.write(' appended')
+''', output_file='fixture.txt')
+    assert receipt['returncode'] == 0
+    assert receipt['outputs'] == {'fixture.txt': b'UPDATEDthored input appended'}
 
 
 def test_every_output_file_is_collected_without_trimming():

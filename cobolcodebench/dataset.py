@@ -10,6 +10,25 @@ def manifest() -> dict:
     return json.loads(files('cobolcodebench').joinpath('data/manifest.json').read_text(encoding='utf-8'))
 
 
+def eligibility() -> dict:
+    """Validate the reference check's complete partition of the upstream IDs."""
+    info = json.loads(files('cobolcodebench').joinpath('data/eligibility.json').read_text(encoding='utf-8'))
+    source = manifest()
+    eligible, excluded = info['eligible_task_ids'], info['excluded_tasks']
+    if (info['schema_version'] != 1 or info['source_sha256'] != source['source_sha256']
+            or len(eligible) != len(set(eligible)) or set(eligible) & set(excluded)
+            or set(eligible) | set(excluded) != set(source['task_ids'])
+            or eligible != [name for name in source['task_ids'] if name not in excluded]
+            or any(not entry.get('reason') for entry in excluded.values())):
+        raise ValueError('Invalid dataset eligibility')
+    return info
+
+
+def load_eligible_records() -> list[dict]:
+    selected = set(eligibility()['eligible_task_ids'])
+    return [record for record in load_records() if record['program_name'] in selected]
+
+
 def file_names(value: str) -> list[str]:
     names = [name.strip() for name in value.split(',') if name.strip()]
     if len(set(names)) != len(names) or any(

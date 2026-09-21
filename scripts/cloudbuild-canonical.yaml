@@ -1,0 +1,13 @@
+steps:
+  - name: '${_SANDBOX_IMAGE}'
+    entrypoint: /usr/local/bin/python3
+    args:
+      - scripts/canonical_check.py
+      - --image
+      - '${_SANDBOX_IMAGE}'
+      - --output
+      - /workspace/.build/canonical-eligibility.json
+substitutions:
+  _SANDBOX_IMAGE: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0
+# 46 tasks, independently bounded compile/run steps, plus image startup.
+timeout: 6000s

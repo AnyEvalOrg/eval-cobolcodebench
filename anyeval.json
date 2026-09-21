@@ -36,14 +36,14 @@
   "tasks": [
     {
       "name": "cobolcodebench_instruct",
-      "samples": 46
+      "samples": 38
     },
     {
       "name": "cobolcodebench_complete",
-      "samples": 46
+      "samples": 38
     }
   ],
-  "total_samples": 92,
+  "total_samples": 76,
   "external_assets": [
     {
       "type": "container",

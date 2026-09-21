@@ -56,3 +56,28 @@ def test_checksum_failure_is_private(monkeypatch):
     monkeypatch.setattr(dataset, 'manifest', lambda: {'artifact_sha256': 'wrong'})
     with pytest.raises(RuntimeError, match='details withheld'):
         load_records()
+
+
+def test_reference_eligibility_partition_and_reasons():
+    from cobolcodebench.dataset import eligibility, load_eligible_records
+    from cobolcodebench.task import load_dataset
+    info = eligibility()
+    assert info['checked_at'] == '2026-09-20'
+    assert set(info['excluded_tasks']) == {f'task_func_{n:02}' for n in (17,20,21,23,47,48,49,55)}
+    assert info['excluded_tasks']['task_func_17']['reason'] == 'compile error'
+    for n in (20, 55):
+        assert info['excluded_tasks'][f'task_func_{n}']['reason'] == 'run error (exit 1)'
+    for n in (21,23,47,48,49):
+        assert info['excluded_tasks'][f'task_func_{n}']['reason'].startswith('output mismatch')
+    assert 'also an input' in info['excluded_tasks']['task_func_49']['reason']
+    assert len(info['eligible_task_ids']) == len(load_eligible_records()) == 38
+    for mode in ('instruct', 'complete'):
+        assert [sample.id for sample in load_dataset(mode)] == info['eligible_task_ids']
+
+
+def test_eligibility_rejects_an_incomplete_partition(monkeypatch):
+    import cobolcodebench.dataset as dataset
+    original = dataset.manifest()
+    monkeypatch.setattr(dataset, 'manifest', lambda: {**original, 'task_ids': original['task_ids'][:-1]})
+    with pytest.raises(ValueError, match='eligibility'):
+        dataset.eligibility()

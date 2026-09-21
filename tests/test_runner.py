@@ -31,3 +31,9 @@ def test_bundle_omits_test_metadata_and_unverified_provenance(tmp_path):
     assert bundle["model"]["served"] == []
     assert "SECRET_SENTINEL" not in path.read_text()
     assert json.loads(path.read_text())["eval"]["sample_id"] == sample_id
+
+
+@pytest.mark.parametrize('sample_id', ['task_func_17', 'task_func_49'])
+def test_runner_rejects_excluded_ids(sample_id):
+    with pytest.raises(ValueError, match='eligible dataset'):
+        run.validate_sample_id(sample_id)

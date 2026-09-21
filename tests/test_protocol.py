@@ -75,3 +75,8 @@ def test_fuzz_ratio_known_values():
     assert fuzz_ratio('', 'a') == 0
     assert fuzz_ratio('abc', 'xya') == 33
     assert fuzz_ratio('abc', 'abc') == 100
+
+
+def test_comparison_rejects_undecoded_wire_outputs():
+    with pytest.raises(TypeError, match='decoded file bytes'):
+        compare_outputs({'a': 'YWJj'}, {'a': 'abc'})

@@ -38,15 +38,15 @@ def main() -> None:
     # No prior import of cobolcodebench: this must load the installed entry point.
     task = registry_create("task", "cobolcodebench/cobolcodebench_instruct", sandbox_type="docker")
     import cobolcodebench
-    from cobolcodebench.dataset import manifest
+    from cobolcodebench.dataset import eligibility
 
     assert Path(cobolcodebench.__file__).is_relative_to(installed)
-    assert len(task.dataset) == 46
-    assert [sample.id for sample in task.dataset] == manifest()["task_ids"]
+    assert len(task.dataset) == 38
+    assert [sample.id for sample in task.dataset] == eligibility()["eligible_task_ids"]
     assert task.epochs == 1
     assert Path(task.sandbox.config).is_relative_to(installed)
     reverse = registry_create("task", "cobolcodebench/cobolcodebench_complete", sandbox_type="docker")
-    assert [s.id for s in reverse.dataset] == manifest()["task_ids"]
+    assert [s.id for s in reverse.dataset] == eligibility()["eligible_task_ids"]
     assert reverse.epochs == 1
     from importlib.resources import files
     from importlib.metadata import version
@@ -56,7 +56,7 @@ def main() -> None:
         assert files('cobolcodebench').joinpath(asset).is_file()
     default = registry_create("task", "cobolcodebench/cobolcodebench_instruct")
     assert Path(default.sandbox.config.chart).is_relative_to(installed)
-    print("Cold installed-wheel discovery: PASS; 2 tasks x 46 exact ids; network blocked; no checkout imports.")
+    print("Cold installed-wheel discovery: PASS; 2 tasks x 38 eligible ids; network blocked; no checkout imports.")
 
 
 if __name__ == "__main__":

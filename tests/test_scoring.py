@@ -311,3 +311,32 @@ def test_receipt_for_another_directory_is_incorrect(monkeypatch):
     fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/ccb-other')])
     install_sandbox(monkeypatch, fake)
     assert asyncio.run(scoring.file_scorer('complete')(state(), Target(''))).value == INCORRECT
+
+
+@pytest.mark.parametrize('sample_id', ['task_func_02', 'task_func_05'])
+@pytest.mark.parametrize('mode', ['instruct', 'complete'])
+def test_actual_runner_base64_receipt_scores_correct(monkeypatch, sample_id, mode):
+    from cobolcodebench.dataset import load_records
+    from test_sandbox_runner import run_fixture
+    selected = next(r for r in load_records() if r['program_name'] == sample_id)
+    expected = json.loads(selected['outputs'])
+    # Authored Python fixture writes the exact expected bytes. No canonical
+    # program runs locally. RUNNER itself reads/b64encodes/signs the receipt.
+    writer = '\n'.join(f'open({name!r}, "wb").write({value.encode("utf-8")!r})'
+                       for name, value in expected.items())
+    envelope, setup = run_fixture(run_code=writer, output_file=list(expected), raw_receipt=True)
+
+    class RunnerReceiptSandbox(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd[-1] == scoring.SETUP:
+                return result(json.dumps(setup))
+            return await super().exec(cmd, **kwargs)
+
+    monkeypatch.setattr(scoring, 'load_records', lambda: [selected])
+    install_sandbox(monkeypatch, RunnerReceiptSandbox([envelope]))
+    candidate = state(mode)
+    candidate.sample_id = sample_id
+    score = asyncio.run(scoring.file_scorer(mode)(candidate, Target('')))
+    assert score.value == CORRECT
+    assert json.loads(score.explanation) == dict(compile_success=True, upstream_score=1.0,
+                                                reason=f'{len(expected)}/{len(expected)} output files match exactly')

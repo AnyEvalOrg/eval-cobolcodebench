@@ -18,10 +18,10 @@ TASK_PREFIX = "cobolcodebench/"
 def validate_sample_id(sample_id: str) -> str:
     if any(char in sample_id for char in "*?[]"):
         raise ValueError("refusing glob-like sample id: pass one literal id")
-    from cobolcodebench.dataset import manifest
+    from cobolcodebench.dataset import eligibility
 
-    if sample_id not in manifest()["task_ids"]:
-        raise ValueError("sample id is not in the packaged dataset")
+    if sample_id not in eligibility()["eligible_task_ids"]:
+        raise ValueError("sample id is not in the eligible dataset")
     return sample_id
 
 
