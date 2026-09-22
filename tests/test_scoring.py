@@ -531,3 +531,74 @@ def test_nonzero_prerequisite_setup_is_withheld_harness_error(monkeypatch, stdou
     assert_sample_error()
     assert not any(scoring.RUNNER in cmd for cmd, _ in fake.calls)
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('response', ['', TimeoutError('PRIVATE'), ConnectionError('PRIVATE')])
+@pytest.mark.parametrize('cleanup_fails', [False, True])
+@pytest.mark.parametrize('fields,reason', [
+    ({'terminated': 'OOMKilled'}, 'sandbox memory exhausted during candidate execution'),
+    ({'last': 'OOMKilled'}, 'sandbox memory exhausted during candidate execution'),
+    ({'terminated': 'Error', 'exit_code': 137}, 'sandbox memory exhausted during candidate execution'),
+    ({'last': 'Error', 'signal': 9}, 'sandbox memory exhausted during candidate execution'),
+    ({'phase': 'Failed', 'reason': 'Evicted', 'message': 'ephemeral-storage exceeded'},
+     'sandbox storage exhausted during candidate execution'),
+])
+def test_missing_receipt_kernel_evidence_survives_cleanup(monkeypatch, response, cleanup_fails, fields, reason):
+    from cobolcodebench import sandbox_state
+    from test_sandbox_state import pod
+    class DeadSandbox(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cleanup_fails and cmd == scoring.CLEANUP_COMMAND:
+                raise ConnectionError('PRIVATE')
+            return await super().exec(cmd, **kwargs)
+    fake = DeadSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    def lookup(env):
+        assert env._sandbox is fake
+        assert any(scoring.RUNNER in cmd for cmd, _ in fake.calls)
+        return pod(**fields)
+    monkeypatch.setattr(sandbox_state, '_read_pod', lookup)
+    score = asyncio.run(scoring.file_scorer('complete')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert json.loads(score.explanation) == dict(compile_success=None, upstream_score=0.0, reason=reason)
+
+
+@pytest.mark.parametrize('phase', ['setup', 'signed'])
+def test_setup_failure_and_signed_receipt_never_consult_kernel(monkeypatch, phase):
+    async def forbidden(env):
+        pytest.fail('classification outside missing RUNNER receipt')
+    class Environment(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if phase == 'setup' and scoring.SETUP in cmd:
+                raise TimeoutError('PRIVATE')
+            return await super().exec(cmd, **kwargs)
+    install_sandbox(monkeypatch, Environment([result()]))
+    monkeypatch.setattr(scoring, 'sandbox_failure', forbidden)
+    if phase == 'setup':
+        assert_sample_error()
+    else:
+        assert asyncio.run(scoring.file_scorer('complete')(state(), Target(''))).value == CORRECT
+
+
+@pytest.mark.parametrize('outcome', ['running', 'node', 'node_running', 'preemption', 'lookup_failure', 'gone', 'evicted'])
+def test_outer_kill_is_never_itself_a_candidate_verdict(monkeypatch, outcome):
+    from cobolcodebench import sandbox_state
+    from test_sandbox_state import pod
+    class KilledRunner(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.RUNNER in cmd:
+                return result('', returncode=137)
+            return await super().exec(cmd, **kwargs)
+    def lookup(env):
+        if outcome == 'lookup_failure':
+            raise ConnectionError('PRIVATE')
+        if outcome == 'gone':
+            from kubernetes.client.exceptions import ApiException
+            raise ApiException(status=404, reason='Spot preemption')
+        return {'running': pod(), 'node': pod(phase='Unknown', reason='NodeNotReady'),
+                'node_running': pod(reason='NodeNotReady'),
+                'evicted': pod(phase='Failed', reason='Evicted', terminated='Error', exit_code=137),
+                'preemption': pod(phase='Failed', reason='Shutdown')}.get(outcome)
+    install_sandbox(monkeypatch, KilledRunner([]))
+    monkeypatch.setattr(sandbox_state, '_read_pod', lookup)
+    assert_sample_error()

@@ -50,13 +50,15 @@ services:
     # Guaranteed QoS: 768 MiB candidate RSS + 256 MiB directory-visible and
     # descriptor-retained bytes + polling/scan bursts + supervisor/runtime
     # overhead must fit below 2 GiB. Writable memory-backed filesystem space
-    # is zero; anonymous memfds are charged by the descriptor scan.
+    # is read-only; descriptor-retained memfds are charged by the fd scan.
+    # Unenumerated kernel allocations can still OOM: the scorer uses the
+    # pod's OOMKilled status as the missing-receipt attribution backstop.
     # RSS polling: 50 ms; disk polling: 100 ms, with cancellation/byte checks
     # every entry and a 10,000-entry cap. AS/DATA=1 GiB, NPROC=64,
     # NOFILE=256 (1024 for Java). oom_score_adj is not a gVisor boundary.
     # /tmp is disk-backed and executable. Its 512 MiB emptyDir sizeLimit and
     # 1 GiB pod ephemeral-storage limit are eviction backstops; the watchdog
-    # is the real bound, including unlinked files. /var/tmp is watched too.
+    # handles common cases, including unlinked files. /var/tmp is watched too.
     resources:
       requests:
         cpu: "1"

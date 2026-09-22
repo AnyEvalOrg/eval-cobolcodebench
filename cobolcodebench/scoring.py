@@ -16,6 +16,7 @@ from .execution import execution_request
 from .code_extractor import assemble_program
 from .comparison import compare_outputs
 from .receipts import verify_receipt, receipt_failure
+from .sandbox_state import sandbox_failure
 
 
 def verdict(reason: str, compile_success: bool | None = None,
@@ -47,6 +48,7 @@ def file_scorer(mode: str):
         deadline = payload['timeout'] + payload['run_timeout'] + 10
         receipt = None
         signed_failure = None
+        kernel_failure = None
         cleanup_failed = False
         cleanup_after = 0
         try:
@@ -88,9 +90,19 @@ def file_scorer(mode: str):
                         else:
                             receipt = None
                     except Exception:
-                        # No authenticated supervisor report is a harness failure,
-                        # including a killed supervisor or lost exec response.
                         receipt = None
+                    if receipt is None:
+                        kernel_failure = await sandbox_failure(private)
+                        if kernel_failure is not None:
+                            cleanup_after = 0
+                        # A Running pod, even after timeout -s KILL returns 137,
+                        # cannot authenticate a "supervisor deadline exceeded"
+                        # verdict: exec transport stalls and infrastructure CPU
+                        # starvation look identical. Keep these harness errors
+                        # so infrastructure cannot enter the pass rate. Candidate
+                        # timeouts normally yield signed failures; a missing
+                        # receipt with inconclusive kernel evidence withholds the
+                        # entire run, never silently drops a sample from its rate.
                 finally:
                     # A separate sandbox exec, never the candidate's parent or
                     # session, enforces cleanup on EVERY path (also setup failure).
@@ -104,7 +116,7 @@ def file_scorer(mode: str):
                         # The pod is per-sample and discarded afterwards; there is
                         # no reuse across samples. Cleanup cannot erase a signed
                         # failure or turn candidate misbehaviour into a harness error.
-                        if receipt is None:
+                        if receipt is None and kernel_failure is None:
                             raise
                         cleanup_failed = True
         except Exception:
@@ -113,6 +125,8 @@ def file_scorer(mode: str):
             raise RuntimeError("Private sandbox operation failed; details withheld.") from None
         # Neither success nor returncode from the run provider is a verdict channel.
         if receipt is None:
+            if kernel_failure is not None:
+                return verdict(kernel_failure)
             raise RuntimeError("Private sandbox operation failed; details withheld.") from None
         compiled = receipt['compile_success']
         if signed_failure is not None:

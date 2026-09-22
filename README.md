@@ -161,8 +161,9 @@ disk-backed emptyDir with a 512 MiB sizeLimit as an eviction backstop; the pod's
 ephemeral-storage budget is 1 GiB. Compose uses an anonymous disk-backed `/tmp`
 volume, without a portable disk quota. `/dev/shm` is mounted **read-only**
 (Memory emptyDir in Kubernetes; read-only, size=16m tmpfs in Docker).
-Writable memory-backed filesystem space is zero; anonymous memfds remain
-possible and are charged by the descriptor scan described below.
+Writable memory-backed filesystem mounts are read-only; anonymous memfds and
+other kernel memory allocations remain possible. Descriptor-retained memfds
+are charged by the descriptor scan described below.
 
 Before issuing a receipt key or launching candidate code, `SETUP` starts a
 trusted short-lived probe through the same `restrict_child` path. It checks
@@ -194,7 +195,12 @@ The 2 GiB memory budget allows 768 MiB aggregate RSS + 256 MiB file/memfd bytes
 (1024 MiB nominal headroom before bursts/overhead). RSS polls every 50 ms; disk
 scans repeat after 100 ms. These are sampling bounds, so bursts include scan
 latency as well as the polling interval. EmptyDir sizeLimit is an eviction
-backstop, not an enforced tmpfs quota under gVisor; the watchdog is the bound.
+backstop, not an enforced tmpfs quota under gVisor. Watchdogs handle common
+cases with a signed receipt and keep the pod alive; they cannot enumerate all
+kernel memory sinks. Detached System V segments, memfds retained only by tiny
+PROT_NONE mappings after close, socket queues, pipes, and POSIX mqueues can
+consume memory outside their accounting. Kubernetes attribution is the backstop
+for these unenumerated allocations, rather than adding more sink enumeration.
 Every directory/descriptor entry checks cancellation, and byte/inode exhaustion
 returns immediately. On candidate exit, the runner sets stop and joins each
 daemon watchdog for at most 0.2 s; a blocked scan cannot hold up signing.
@@ -203,9 +209,30 @@ steps; its shared image and supervisor environment set
 `JAVA_TOOL_OPTIONS=-XX:-UsePerfData` for Java tools. Candidate stdout cannot
 forge a passing provider completion marker.
 The output bound is **1 MiB** per captured stream/file and in aggregate across
-result files; reaching the bound fails. A missing or unverifiable authenticated
-receipt is a harness failure: Inspect records a sanitized sample error, and
-AnyEval refuses to publish the run. It does not enter the published pass rate.
+result files; reaching the bound fails. After successful `SETUP`, a missing or
+unverifiable `RUNNER` receipt triggers a Kubernetes status lookup for the exact
+sample pod (including UID), using the provider's client and kubeconfig context.
+The lookup has a four-second host deadline and one-second connect/read timeouts.
+Container `state.terminated` or `lastState.terminated` reason `OOMKilled`, exit
+code 137, or signal 9 on the same UID, non-Evicted pod scores
+`INCORRECT`: `sandbox memory exhausted during candidate execution`. A Failed
+pod with reason `Evicted` and a message naming `ephemeral-storage` scores
+`INCORRECT`: `sandbox storage exhausted during candidate execution`.
+These verdicts have `compile_success=null` because no receipt proves compilation.
+runsc sandboxes killed by the host memory cgroup can be reported by containerd
+as reason `Error` with exit 137 instead of `OOMKilled`. Production scoring
+publishes no raw pod message or provider exception.
+
+Setup failures, failed/inconclusive lookups, missing/replaced pods, node failures,
+Spot preemption, other evictions, and transport errors with a Running pod remain
+withheld harness errors. Spot preemption deletes the pod (lookup returns 404);
+a NotReady node leaves a Running/Unknown pod without container termination
+evidence. A Running pod without termination evidence after the outer
+`timeout -s KILL` (even exec exit 137) cannot distinguish a supervisor deadline
+from infrastructure stalls.
+Candidate timeouts normally produce signed failures. Without authenticated or
+kernel evidence, Inspect records a sanitized sample error and AnyEval refuses
+to publish the entire run; the sample is never silently dropped from the rate.
 The supervisor kills process groups and sweeps `/proc` using `os.kill`, without
 spawning cleanup processes. Post-run exceptions produce signed failure flags.
 It builds, writes and flushes the receipt, then immediately calls `os._exit(0)`;
@@ -214,8 +241,9 @@ quiescence and deletes `/tmp/ccb-*`, under its own five-second KILL deadline.
 The scorer decides authenticated failure before that cleanup: cleanup failure
 preserves the signed `INCORRECT` reason. After a successful receipt, cleanup
 failure instead scores `INCORRECT` with reason `candidate left processes that
-could not be cleaned up`. Cleanup failure without an authenticated receipt
-remains a sanitized harness error. The pod is per-sample and discarded
+could not be cleaned up`. Cleanup failure also preserves kernel-attributed
+exhaustion verdicts; without either kind of evidence it remains a sanitized
+harness error. The pod is per-sample and discarded
 afterwards, so it is never reused across samples.
 
 ## Scores and publication
@@ -229,13 +257,13 @@ channel. Raw stdout and file bytes are base64-encoded before signing. The scorer
 authenticates the envelope and strictly validates supervisor status fields first.
 Malformed output fields or undecodable text then score `INCORRECT` with reason
 `output not decodable`; they never become a missing receipt. Bad signatures or
-corrupt supervisor status fields remain harness errors.
+corrupt supervisor status fields take the same missing-receipt attribution path.
 Authenticated receipt file values are base64-decoded exactly once
 before comparison; encoded strings are rejected
 at the comparison boundary. No whitespace or newline normalization is applied
 to the exact verdict.
 
-The JSON explanation always records `compile_success` (true/false), a numeric
+The JSON explanation always records `compile_success` (true/false/null), a numeric
 `upstream_score`, and a short result reason. No file contents or compiler
 diagnostics appear in explanations.
 
@@ -372,9 +400,31 @@ exit 0 with a detached sleeping child (requiring a successful receipt and
 cleanup). The disk writer creates a work-directory file and fills a second
 directory directly under `/tmp`, proving coverage beyond the work directory.
 Fork exhaustion accepts exit 1 with its witness or `memory_exceeded=true`.
-Every case must authenticate, meet its expected outcome, clean up,
-and leave the same pod usable before the scorer returns `CORRECT`. Printed
-JSON summaries contain boolean flags only. Run this on the production runtime;
+These earlier cases must authenticate, meet their expected outcomes, clean up,
+and leave the same pod usable before the scorer returns `CORRECT`.
+
+The task then schedules three separate samples, each with its own fresh pod:
+64 MiB System V shm segments filled and detached without `IPC_RMID`, 1 MiB
+memfds retained by 4 KiB PROT_NONE mappings after close, and socketpair queues.
+Inspect's `SampleSource` queues them one at a time only after earlier samples
+finish, even with concurrent sample execution enabled. Each must produce a
+signed `memory_exceeded`/`disk_exceeded` receipt or lose its pod with Kubernetes
+reporting `OOMKilled`, container exit 137, or signal 9 on the same non-Evicted
+pod UID and the production classifier mapping it to `INCORRECT`.
+An initial runtime refusal of SysV shm passes with the authenticated
+`sysv_unavailable` flag. Dead pods need not pass cleanup or usability probes.
+The Docker regression also runs these three cases last, in individual 2 GiB
+containers, accepting signed limit receipts (or SysV refusal) or Docker exit 137
+without a receipt. That exit status exercises container death only, not Kubernetes
+attribution. When a RUNNER receipt is missing, the Kubernetes regression also
+records `classification_evidence` in sample metadata: each classifier lookup's
+pod phase/reason/message, every container's current and previous termination
+reason/exitCode/signal/message, lookup failure (exception class only), and a
+404/gone flag. Kubelet messages are truncated to 200 characters; candidate
+output and exception text are excluded. Each entry includes monotonic seconds
+from RUNNER exec failure (or return without a valid receipt) to lookup start.
+
+Printed Kubernetes JSON summaries contain boolean flags only. Run this on the production runtime;
 unit tests and native Docker checks alone do not establish gVisor behaviour.
 
 `anyeval.json` declares `sandbox-k8s` and 38 samples per task. Publishing into

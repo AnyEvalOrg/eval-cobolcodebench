@@ -21,11 +21,21 @@ class _PrivateFilter(logging.Filter):
 # logger levels globally or suppressing concurrent samples' provenance diagnostics.
 for _name in (
     "k8s_sandbox._logger",
+    "kubernetes.client.rest",
     "inspect_ai.util._sandbox.docker.compose",
     "inspect_ai.util._sandbox.docker.util",
     "inspect_ai.util._subprocess",
 ):
     logging.getLogger(_name).addFilter(_PrivateFilter())
+
+
+@contextmanager
+def private_logging():
+    token = _PRIVATE.set(True)
+    try:
+        yield
+    finally:
+        _PRIVATE.reset(token)
 
 
 @contextmanager
@@ -35,9 +45,6 @@ def private_grading(environment):
     if not isinstance(environment, SandboxEnvironmentProxy):
         raise TypeError("Grading requires Inspect's pinned sandbox event proxy")
     private = SandboxEnvironmentProxy(environment._sandbox)
-    token = _PRIVATE.set(True)
-    try:
+    with private_logging():
         with private.no_events():
             yield private
-    finally:
-        _PRIVATE.reset(token)
